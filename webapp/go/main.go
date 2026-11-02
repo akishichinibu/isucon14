@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -20,6 +21,14 @@ import (
 )
 
 var db *sqlx.DB
+
+// matchingPaused is set around POST /api/initialize while tables are dropped/rebuilt.
+var matchingPaused atomic.Bool
+
+func isDeadlock(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1213
+}
 
 func main() {
 	mux := setup()
@@ -133,6 +142,11 @@ func postInitialize(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+
+	matchingPaused.Store(true)
+	matchingMu.Lock()
+	matchingMu.Unlock()
+	defer matchingPaused.Store(false)
 
 	if out, err := exec.Command("../sql/init.sh").CombinedOutput(); err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("failed to initialize: %s: %w", string(out), err))

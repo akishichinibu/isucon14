@@ -40,10 +40,38 @@ func appPostUsers(w http.ResponseWriter, r *http.Request) {
 	accessToken := secureRandomStr(32)
 	invitationCode := secureRandomStr(15)
 
+	var lastErr error
+	for attempt := 0; attempt < 8; attempt++ {
+		lastErr = appPostUsersOnce(ctx, req, userID, accessToken, invitationCode)
+		if lastErr == nil {
+			http.SetCookie(w, &http.Cookie{
+				Path:  "/",
+				Name:  "app_session",
+				Value: accessToken,
+			})
+			writeJSON(w, http.StatusCreated, &appPostUsersResponse{
+				ID:             userID,
+				InvitationCode: invitationCode,
+			})
+			return
+		}
+		if !isDeadlock(lastErr) {
+			break
+		}
+	}
+	if errors.Is(lastErr, errInvitationUnavailable) {
+		writeError(w, http.StatusBadRequest, lastErr)
+		return
+	}
+	writeError(w, http.StatusInternalServerError, lastErr)
+}
+
+var errInvitationUnavailable = errors.New("この招待コードは使用できません。")
+
+func appPostUsersOnce(ctx context.Context, req *appPostUsersRequest, userID, accessToken, invitationCode string) error {
 	tx, err := db.Beginx()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return err
 	}
 	defer tx.Rollback()
 
@@ -53,84 +81,56 @@ func appPostUsers(w http.ResponseWriter, r *http.Request) {
 		userID, req.Username, req.FirstName, req.LastName, req.DateOfBirth, accessToken, invitationCode,
 	)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return err
 	}
 
-	// 初回登録キャンペーンのクーポンを付与
 	_, err = tx.ExecContext(
 		ctx,
 		"INSERT INTO coupons (user_id, code, discount) VALUES (?, ?, ?)",
 		userID, "CP_NEW2024", 3000,
 	)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return err
 	}
 
-	// 招待コードを使った登録
 	if req.InvitationCode != nil && *req.InvitationCode != "" {
-		// 招待する側の招待数をチェック
 		var coupons []Coupon
 		err = tx.SelectContext(ctx, &coupons, "SELECT * FROM coupons WHERE code = ? FOR UPDATE", "INV_"+*req.InvitationCode)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
+			return err
 		}
 		if len(coupons) >= 3 {
-			writeError(w, http.StatusBadRequest, errors.New("この招待コードは使用できません。"))
-			return
+			return errInvitationUnavailable
 		}
 
-		// ユーザーチェック
 		var inviter User
 		err = tx.GetContext(ctx, &inviter, "SELECT * FROM users WHERE invitation_code = ?", *req.InvitationCode)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				writeError(w, http.StatusBadRequest, errors.New("この招待コードは使用できません。"))
-				return
+				return errInvitationUnavailable
 			}
-			writeError(w, http.StatusInternalServerError, err)
-			return
+			return err
 		}
 
-		// 招待クーポン付与
 		_, err = tx.ExecContext(
 			ctx,
 			"INSERT INTO coupons (user_id, code, discount) VALUES (?, ?, ?)",
 			userID, "INV_"+*req.InvitationCode, 1500,
 		)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
+			return err
 		}
-		// 招待した人にもRewardを付与
 		_, err = tx.ExecContext(
 			ctx,
 			"INSERT INTO coupons (user_id, code, discount) VALUES (?, CONCAT(?, '_', FLOOR(UNIX_TIMESTAMP(NOW(3))*1000)), ?)",
 			inviter.ID, "RWD_"+*req.InvitationCode, 1000,
 		)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
+			return err
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-
-	http.SetCookie(w, &http.Cookie{
-		Path:  "/",
-		Name:  "app_session",
-		Value: accessToken,
-	})
-
-	writeJSON(w, http.StatusCreated, &appPostUsersResponse{
-		ID:             userID,
-		InvitationCode: invitationCode,
-	})
+	return tx.Commit()
 }
 
 type appPostPaymentMethodsRequest struct {

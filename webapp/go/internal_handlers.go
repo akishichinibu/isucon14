@@ -32,6 +32,9 @@ func matchingLoop() {
 	ticker := time.NewTicker(matchingTick)
 	defer ticker.Stop()
 	for range ticker.C {
+		if matchingPaused.Load() {
+			continue
+		}
 		if !matchingMu.TryLock() {
 			continue
 		}
@@ -46,6 +49,10 @@ func matchingLoop() {
 // internalGetMatching assigns idle chairs to unmatched rides.
 // systemd isuride-matcher curls this; an in-process loop also calls the same matcher.
 func internalGetMatching(w http.ResponseWriter, r *http.Request) {
+	if matchingPaused.Load() {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	matchingMu.Lock()
 	err := matchRidesLocked(r.Context())
 	matchingMu.Unlock()
@@ -105,6 +112,12 @@ WHERE c.is_active = TRUE
   AND NOT EXISTS (
     SELECT 1 FROM rides r
     WHERE r.chair_id = c.id AND r.evaluation IS NULL
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM rides r
+    INNER JOIN ride_statuses rs ON rs.ride_id = r.id
+      AND rs.status = 'COMPLETED' AND rs.chair_sent_at IS NULL
+    WHERE r.chair_id = c.id
   )`); err != nil {
 		return err
 	}
@@ -170,8 +183,16 @@ WHERE c.is_active = TRUE
 			     SELECT 1 FROM (
 			       SELECT id FROM rides WHERE chair_id = ? AND evaluation IS NULL LIMIT 1
 			     ) busy
+			   )
+			   AND NOT EXISTS (
+			     SELECT 1 FROM (
+			       SELECT r.id FROM rides r
+			       INNER JOIN ride_statuses rs ON rs.ride_id = r.id
+			         AND rs.status = 'COMPLETED' AND rs.chair_sent_at IS NULL
+			       WHERE r.chair_id = ? LIMIT 1
+			     ) unsent
 			   )`,
-			chairID, ride.ID, chairID,
+			chairID, ride.ID, chairID, chairID,
 		)
 		if err != nil {
 			return err
