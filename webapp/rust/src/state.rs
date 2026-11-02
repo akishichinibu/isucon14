@@ -32,6 +32,7 @@ pub struct ChairMem {
     pub completed_unsent: bool,
     pub total_rides_count: i32,
     pub total_evaluation_sum: i32,
+    pub accrued_sales: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -204,6 +205,19 @@ impl World {
             .chairs
             .get(chair_id)
             .and_then(|c| c.current_ride.as_ref().map(|r| r.ride_id.clone()));
+        let fare = ride_id
+            .as_ref()
+            .and_then(|rid| {
+                self.rides.get(rid).map(|r| {
+                    crate::calculate_fare(
+                        r.pickup_latitude,
+                        r.pickup_longitude,
+                        r.destination_latitude,
+                        r.destination_longitude,
+                    )
+                })
+            })
+            .unwrap_or(0);
         if let Some(rid) = ride_id {
             self.push_status(&rid, "COMPLETED");
         }
@@ -212,6 +226,7 @@ impl World {
             c.completed_unsent = true;
             c.total_rides_count += 1;
             c.total_evaluation_sum += evaluation;
+            c.accrued_sales += fare;
         }
     }
 
@@ -286,6 +301,55 @@ impl World {
             .filter(|c| c.owner_id == owner_id)
             .cloned()
             .collect()
+    }
+
+    pub fn owner_sales(
+        &self,
+        owner_id: &str,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+        use_accrued: bool,
+    ) -> (i32, Vec<(ChairMem, i32)>, std::collections::HashMap<String, i32>) {
+        let chairs: Vec<ChairMem> = self
+            .chairs
+            .values()
+            .filter(|c| c.owner_id == owner_id)
+            .cloned()
+            .collect();
+        let chair_ids: std::collections::HashSet<String> =
+            chairs.iter().map(|c| c.id.clone()).collect();
+        let mut by_chair: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
+        if use_accrued {
+            for chair in &chairs {
+                by_chair.insert(chair.id.clone(), chair.accrued_sales);
+            }
+        } else {
+            for ride in self.rides.values() {
+                if ride.status != "COMPLETED" {
+                    continue;
+                }
+                if ride.updated_at < since || ride.updated_at > until {
+                    continue;
+                }
+                let Some(cid) = ride.chair_id.as_ref() else {
+                    continue;
+                };
+                if !chair_ids.contains(cid) {
+                    continue;
+                }
+                *by_chair.entry(cid.clone()).or_insert(0) += ride.fare;
+            }
+        }
+        let mut total = 0;
+        let mut chair_sales = Vec::with_capacity(chairs.len());
+        let mut by_model: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
+        for chair in chairs {
+            let s = *by_chair.get(&chair.id).unwrap_or(&0);
+            total += s;
+            *by_model.entry(chair.model.clone()).or_insert(0) += s;
+            chair_sales.push((chair, s));
+        }
+        (total, chair_sales, by_model)
     }
 
     pub fn match_once(&mut self) -> Vec<(String, String, ChairRideHint)> {
@@ -376,6 +440,7 @@ struct RideRow {
     destination_longitude: i32,
     latest_status: String,
     created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -400,9 +465,8 @@ pub async fn load_world(pool: &sqlx::MySqlPool) -> sqlx::Result<World> {
 
     let rides: Vec<RideRow> = sqlx::query_as(
         r#"SELECT id, user_id, chair_id, pickup_latitude, pickup_longitude,
-                  destination_latitude, destination_longitude, latest_status, created_at
-           FROM rides
-           WHERE chair_id IS NULL OR latest_status <> 'COMPLETED'"#,
+                  destination_latitude, destination_longitude, latest_status, created_at, updated_at
+           FROM rides"#,
     )
     .fetch_all(pool)
     .await?;
@@ -441,6 +505,7 @@ pub async fn load_world(pool: &sqlx::MySqlPool) -> sqlx::Result<World> {
                 completed_unsent: false,
                 total_rides_count: row.total_rides_count.unwrap_or(0),
                 total_evaluation_sum: row.total_evaluation_sum.unwrap_or(0),
+                accrued_sales: 0,
             },
         );
     }
@@ -462,8 +527,12 @@ pub async fn load_world(pool: &sqlx::MySqlPool) -> sqlx::Result<World> {
                 ride.destination_longitude,
             ),
             created_at: ride.created_at,
-            updated_at: ride.created_at,
+            updated_at: ride.updated_at,
         };
+        if ride.latest_status == "COMPLETED" {
+            world.rides.insert(ride.id, mem);
+            continue;
+        }
         if let Some(chair_id) = &ride.chair_id {
             if ride.latest_status != "COMPLETED" {
                 if let Some(c) = world.chairs.get_mut(chair_id) {
@@ -490,6 +559,30 @@ pub async fn load_world(pool: &sqlx::MySqlPool) -> sqlx::Result<World> {
         world.rides.insert(ride.id, mem);
     }
 
+    let accrued: Vec<(String, i32)> = world
+        .rides
+        .values()
+        .filter(|r| r.status == "COMPLETED")
+        .filter_map(|r| {
+            r.chair_id.clone().map(|cid| {
+                (
+                    cid,
+                    crate::calculate_fare(
+                        r.pickup_latitude,
+                        r.pickup_longitude,
+                        r.destination_latitude,
+                        r.destination_longitude,
+                    ),
+                )
+            })
+        })
+        .collect();
+    for (cid, fare) in accrued {
+        if let Some(c) = world.chairs.get_mut(&cid) {
+            c.accrued_sales += fare;
+        }
+    }
+
     Ok(world)
 }
 
@@ -502,10 +595,18 @@ pub fn persist_status(pool: sqlx::MySqlPool, ride_id: String, status: String) {
             .bind(&status)
             .execute(&pool)
             .await;
-        let _ = sqlx::query("UPDATE rides SET latest_status = ?, updated_at = updated_at WHERE id = ?")
-            .bind(&status)
-            .bind(&ride_id)
-            .execute(&pool)
-            .await;
+        // Never walk latest_status backwards (async ARRIVED must not clobber COMPLETED).
+        let _ = sqlx::query(
+            r#"UPDATE rides
+               SET latest_status = ?, updated_at = updated_at
+               WHERE id = ?
+                 AND FIELD(latest_status, 'MATCHING','ENROUTE','PICKUP','CARRYING','ARRIVED','COMPLETED')
+                   < FIELD(?, 'MATCHING','ENROUTE','PICKUP','CARRYING','ARRIVED','COMPLETED')"#,
+        )
+        .bind(&status)
+        .bind(&ride_id)
+        .bind(&status)
+        .execute(&pool)
+        .await;
     });
 }

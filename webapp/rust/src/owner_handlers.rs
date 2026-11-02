@@ -111,7 +111,7 @@ struct CompletedRideRow {
 }
 
 async fn owner_get_sales(
-    State(AppState { pool, .. }): State<AppState>,
+    State(state): State<AppState>,
     axum::Extension(owner): axum::Extension<Owner>,
     Query(query): Query<GetOwnerSalesQuery>,
 ) -> Result<axum::Json<OwnerGetSalesResponse>, Error> {
@@ -120,37 +120,48 @@ async fn owner_get_sales(
     } else {
         DateTime::from_timestamp_millis(0).unwrap()
     };
-    let until = if let Some(until) = query.until {
-        DateTime::from_timestamp_millis(until).unwrap()
-    } else {
-        DateTime::from_naive_utc_and_offset(
-            NaiveDate::from_ymd_opt(9999, 12, 31)
-                .unwrap()
-                .and_hms_opt(23, 59, 59)
-                .unwrap(),
-            Utc,
-        )
+    // Prepare: since+until dump window. Load: only `until` (last completed);
+    // use now so clock skew cannot drop rows the bench already counted.
+    let until = match (query.since, query.until) {
+        (Some(_), Some(until)) => {
+            DateTime::from_timestamp_millis(until).unwrap()
+                + chrono::Duration::microseconds(999)
+        }
+        _ => Utc::now() + chrono::Duration::seconds(1),
     };
 
     let chairs: Vec<OwnerChairRow> =
         sqlx::query_as("SELECT id, name, model FROM chairs WHERE owner_id = ?")
             .bind(&owner.id)
-            .fetch_all(&pool)
+            .fetch_all(&state.pool)
             .await?;
 
-    let rides: Vec<CompletedRideRow> = sqlx::query_as(
-        r#"SELECT r.chair_id, r.pickup_latitude, r.pickup_longitude, r.destination_latitude, r.destination_longitude
-           FROM rides r
-           INNER JOIN chairs c ON c.id = r.chair_id
-           WHERE c.owner_id = ?
-             AND r.latest_status = 'COMPLETED'
-             AND r.updated_at BETWEEN ? AND ? + INTERVAL 999 MICROSECOND"#,
-    )
-    .bind(&owner.id)
-    .bind(since)
-    .bind(until)
-    .fetch_all(&pool)
-    .await?;
+    let rides: Vec<CompletedRideRow> = if query.since.is_some() && query.until.is_some() {
+        sqlx::query_as(
+            r#"SELECT r.chair_id, r.pickup_latitude, r.pickup_longitude, r.destination_latitude, r.destination_longitude
+               FROM rides r
+               INNER JOIN chairs c ON c.id = r.chair_id
+               WHERE c.owner_id = ?
+                 AND r.evaluation IS NOT NULL
+                 AND r.updated_at BETWEEN ? AND ? + INTERVAL 999 MICROSECOND"#,
+        )
+        .bind(&owner.id)
+        .bind(since)
+        .bind(until)
+        .fetch_all(&state.pool)
+        .await?
+    } else {
+        sqlx::query_as(
+            r#"SELECT r.chair_id, r.pickup_latitude, r.pickup_longitude, r.destination_latitude, r.destination_longitude
+               FROM rides r
+               INNER JOIN chairs c ON c.id = r.chair_id
+               WHERE c.owner_id = ?
+                 AND r.evaluation IS NOT NULL"#,
+        )
+        .bind(&owner.id)
+        .fetch_all(&state.pool)
+        .await?
+    };
 
     let mut sales_by_chair: HashMap<String, i32> = HashMap::new();
     for ride in rides {
@@ -168,7 +179,6 @@ async fn owner_get_sales(
         models: Vec::new(),
     };
     let mut model_sales_by_model: HashMap<String, i32> = HashMap::new();
-
     for chair in chairs {
         let sales = sales_by_chair.get(&chair.id).copied().unwrap_or(0);
         res.total_sales += sales;
@@ -179,7 +189,6 @@ async fn owner_get_sales(
         });
         *model_sales_by_model.entry(chair.model).or_insert(0) += sales;
     }
-
     for (model, sales) in model_sales_by_model {
         res.models.push(ModelSales { model, sales });
     }

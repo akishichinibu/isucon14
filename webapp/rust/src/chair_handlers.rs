@@ -98,6 +98,7 @@ async fn chair_post_chairs(
         completed_unsent: false,
         total_rides_count: 0,
         total_evaluation_sum: 0,
+        accrued_sales: 0,
     });
 
     let jar = jar.add(Cookie::build(("chair_session", access_token)).path("/"));

@@ -318,14 +318,10 @@ async fn app_post_rides(
 
     let mut tx = state.pool.begin().await?;
 
-    let continuing: i64 = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM rides WHERE user_id = ? AND latest_status <> 'COMPLETED')",
-    )
-    .bind(&user.id)
-    .fetch_one(&mut *tx)
-    .await?;
-
-    if continuing != 0 {
+    let continuing = state.world.read().unwrap().rides.values().any(|r| {
+        r.user_id == user.id && r.status != "COMPLETED"
+    });
+    if continuing {
         return Err(Error::Conflict("ride already exists"));
     }
 
@@ -516,7 +512,16 @@ async fn app_post_ride_evaluation(
         return Err(Error::NotFound("ride not found"));
     };
 
-    if ride.latest_status != "ARRIVED" {
+    let arrived = state
+        .world
+        .read()
+        .unwrap()
+        .rides
+        .get(&ride_id)
+        .map(|r| r.status == "ARRIVED")
+        .unwrap_or(false)
+        || ride.latest_status == "ARRIVED";
+    if !arrived {
         return Err(Error::BadRequest("not arrived yet"));
     }
 
