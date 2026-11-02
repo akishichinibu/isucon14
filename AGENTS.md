@@ -17,8 +17,8 @@ Homelab practice on t5820. Baseline score 2042, Go reference.
 - `GET /api/internal/matching` every 0.5s: `ORDER BY RAND()`, nested COUNT on ride_statuses.
 - `POST /api/chair/coordinate`: insert-only `chair_locations` + latest-ride status.
 - `GET /api/app/notification` and `GET /api/chair/notification`: 30ms poll, extra queries per call.
-- `GET /api/owner/chairs`: window function over all `chair_locations`.
-- No indexes besides PKs/UNIQUEs. Default sqlx pool. chi request logger on.
+- `GET /api/owner/chairs`: window function over all `chair_locations` until app reads chairs.total_distance.
+- Secondary indexes + denormalized chair location/distance and rides.latest_status: see docs/db.md. sqlx SELECT * needs matching struct fields before deploy.
 
 ## Deploy / bench (orchestrator only)
 

@@ -1,0 +1,33 @@
+# Drop-in for a 4GiB guest, single MySQL 8 instance.
+# Copy to /etc/mysql/mysql.conf.d/isucon.cnf and restart mysqld.
+# Does not change initialize data volume (no huge dumps).
+
+[mysqld]
+# Leave RAM for the app + OS. ~1G buffer pool on a 4GiB guest.
+innodb_buffer_pool_size = 1G
+innodb_buffer_pool_instances = 1
+
+# Durability tradeoff for the 60s bench.
+innodb_flush_log_at_trx_commit = 2
+innodb_flush_method = O_DIRECT
+innodb_flush_neighbors = 0
+
+# Binlog is on by default in MySQL 8; disable for the bench.
+# skip-log-bin and disable_log_bin are synonyms; use one so mysqld starts.
+skip-log-bin
+sync_binlog = 0
+
+# Modest redo log; avoid huge files that slow restart/initialize.
+innodb_redo_log_capacity = 256M
+
+skip_name_resolve
+max_connections = 500
+thread_cache_size = 64
+
+# Save memory on a small guest.
+performance_schema = OFF
+
+table_open_cache = 4000
+table_definition_cache = 2000
+tmp_table_size = 64M
+max_heap_table_size = 64M

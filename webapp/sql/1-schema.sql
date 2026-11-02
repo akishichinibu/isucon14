@@ -24,15 +24,24 @@ CREATE TABLE chair_models
 DROP TABLE IF EXISTS chairs;
 CREATE TABLE chairs
 (
-  id           VARCHAR(26)  NOT NULL COMMENT '椅子ID',
-  owner_id     VARCHAR(26)  NOT NULL COMMENT 'オーナーID',
-  name         VARCHAR(30)  NOT NULL COMMENT '椅子の名前',
-  model        TEXT         NOT NULL COMMENT '椅子のモデル',
-  is_active    TINYINT(1)   NOT NULL COMMENT '配椅子受付中かどうか',
-  access_token VARCHAR(255) NOT NULL COMMENT 'アクセストークン',
-  created_at   DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT '登録日時',
-  updated_at   DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT '更新日時',
-  PRIMARY KEY (id)
+  id                        VARCHAR(26)  NOT NULL COMMENT '椅子ID',
+  owner_id                  VARCHAR(26)  NOT NULL COMMENT 'オーナーID',
+  name                      VARCHAR(30)  NOT NULL COMMENT '椅子の名前',
+  model                     TEXT         NOT NULL COMMENT '椅子のモデル',
+  is_active                 TINYINT(1)   NOT NULL COMMENT '配椅子受付中かどうか',
+  access_token              VARCHAR(255) NOT NULL COMMENT 'アクセストークン',
+  created_at                DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT '登録日時',
+  updated_at                DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT '更新日時',
+  -- Denormalized latest position / distance. App INSERT omits these (DEFAULT/NULL).
+  -- Written on POST /api/chair/coordinate. Fixes CODE=26 once the app writes them.
+  latitude                  INTEGER      NULL COMMENT 'latest latitude from chair_locations',
+  longitude                 INTEGER      NULL COMMENT 'latest longitude from chair_locations',
+  total_distance            INTEGER      NOT NULL DEFAULT 0 COMMENT 'cumulative manhattan distance',
+  total_distance_updated_at DATETIME(6)  NULL COMMENT 'when total_distance was last updated',
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_chairs_access_token (access_token),
+  KEY idx_chairs_is_active (is_active),
+  KEY idx_chairs_owner_id (owner_id)
 )
   COMMENT = '椅子情報テーブル';
 
@@ -44,7 +53,8 @@ CREATE TABLE chair_locations
   latitude   INTEGER     NOT NULL COMMENT '経度',
   longitude  INTEGER     NOT NULL COMMENT '緯度',
   created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT '登録日時',
-  PRIMARY KEY (id)
+  PRIMARY KEY (id),
+  KEY idx_chair_locations_chair_id_created_at (chair_id, created_at)
 )
   COMMENT = '椅子の現在位置情報テーブル';
 
@@ -90,7 +100,13 @@ CREATE TABLE rides
   evaluation            INTEGER     NULL     COMMENT '評価',
   created_at            DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT '要求日時',
   updated_at            DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT '状態更新日時',
-  PRIMARY KEY (id)
+  -- Denormalized latest ride_statuses.status. App INSERT omits this (DEFAULT NULL).
+  latest_status         VARCHAR(16) NULL DEFAULT NULL COMMENT 'latest ride_statuses.status',
+  PRIMARY KEY (id),
+  KEY idx_rides_user_id_created_at (user_id, created_at),
+  KEY idx_rides_chair_id_updated_at (chair_id, updated_at),
+  -- Also covers unmatched rides: WHERE chair_id IS NULL ORDER BY created_at
+  KEY idx_rides_chair_id_created_at (chair_id, created_at)
 )
   COMMENT = 'ライド情報テーブル';
 
@@ -103,7 +119,10 @@ CREATE TABLE ride_statuses
   created_at      DATETIME(6)                                                                NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT '状態変更日時',
   app_sent_at     DATETIME(6)                                                                NULL COMMENT 'ユーザーへの状態通知日時',
   chair_sent_at   DATETIME(6)                                                                NULL COMMENT '椅子への状態通知日時',
-  PRIMARY KEY (id)
+  PRIMARY KEY (id),
+  KEY idx_ride_statuses_ride_id_created_at (ride_id, created_at),
+  KEY idx_ride_statuses_ride_id_app_sent_at (ride_id, app_sent_at, created_at),
+  KEY idx_ride_statuses_ride_id_chair_sent_at (ride_id, chair_sent_at, created_at)
 )
   COMMENT = 'ライドステータスの変更履歴テーブル';
 
@@ -131,6 +150,7 @@ CREATE TABLE coupons
   discount   INTEGER      NOT NULL COMMENT '割引額',
   created_at DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT '付与日時',
   used_by    VARCHAR(26)  NULL COMMENT 'クーポンが適用されたライドのID',
-  PRIMARY KEY (user_id, code)
+  PRIMARY KEY (user_id, code),
+  KEY idx_coupons_used_by (used_by)
 )
   COMMENT 'クーポンテーブル';
