@@ -64,6 +64,12 @@ async fn match_inner(pool: &sqlx::MySqlPool) -> Result<(), Error> {
              AND NOT EXISTS (
                SELECT 1 FROM rides r
                WHERE r.chair_id = c.id AND r.latest_status <> 'COMPLETED'
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM rides r
+               INNER JOIN ride_statuses rs ON rs.ride_id = r.id
+                 AND rs.status = 'COMPLETED' AND rs.chair_sent_at IS NULL
+               WHERE r.chair_id = c.id
              )"#,
     )
     .fetch_all(pool)

@@ -244,33 +244,47 @@ async fn chair_get_notification(
     State(AppState { pool, .. }): State<AppState>,
     axum::Extension(chair): axum::Extension<Chair>,
 ) -> Result<axum::Json<ChairGetNotificationResponse>, Error> {
-    let Some(ride): Option<ChairRideRow> = sqlx::query_as(
-        r#"SELECT id, user_id, pickup_latitude, pickup_longitude, destination_latitude, destination_longitude, latest_status
-           FROM rides
-           WHERE chair_id = ?
-           ORDER BY updated_at DESC
+    let mut tx = pool.begin().await?;
+
+    // Drain unsent statuses across all rides for this chair, oldest first,
+    // so COMPLETED of the previous ride is delivered before MATCHING of the next.
+    let yet_sent: Option<(String, String, String)> = sqlx::query_as(
+        r#"SELECT rs.id, rs.status, rs.ride_id
+           FROM ride_statuses rs
+           INNER JOIN rides r ON r.id = rs.ride_id
+           WHERE r.chair_id = ? AND rs.chair_sent_at IS NULL
+           ORDER BY rs.created_at ASC
            LIMIT 1"#,
     )
     .bind(&chair.id)
-    .fetch_optional(&pool)
-    .await?
-    else {
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let ride: Option<ChairRideRow> = if let Some((_, _, ride_id)) = &yet_sent {
+        sqlx::query_as(
+            r#"SELECT id, user_id, pickup_latitude, pickup_longitude, destination_latitude, destination_longitude, latest_status
+               FROM rides WHERE id = ?"#,
+        )
+        .bind(ride_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    } else {
+        sqlx::query_as(
+            r#"SELECT id, user_id, pickup_latitude, pickup_longitude, destination_latitude, destination_longitude, latest_status
+               FROM rides WHERE chair_id = ? ORDER BY updated_at DESC LIMIT 1"#,
+        )
+        .bind(&chair.id)
+        .fetch_optional(&mut *tx)
+        .await?
+    };
+    let Some(ride) = ride else {
         return Ok(axum::Json(ChairGetNotificationResponse {
             data: None,
             retry_after_ms: NOTIFICATION_RETRY_AFTER_MS,
         }));
     };
 
-    let mut tx = pool.begin().await?;
-
-    let yet_sent: Option<(String, String)> = sqlx::query_as(
-        "SELECT id, status FROM ride_statuses WHERE ride_id = ? AND chair_sent_at IS NULL ORDER BY created_at ASC LIMIT 1",
-    )
-    .bind(&ride.id)
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    let (yet_sent_id, status) = if let Some((id, status)) = yet_sent {
+    let (yet_sent_id, status) = if let Some((id, status, _)) = yet_sent {
         (Some(id), status)
     } else {
         (None, ride.latest_status)
