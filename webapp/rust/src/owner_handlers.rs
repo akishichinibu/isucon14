@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum_extra::extract::cookie::Cookie;
@@ -94,20 +92,17 @@ struct GetOwnerSalesQuery {
     until: Option<i64>,
 }
 
-#[derive(Debug, sqlx::FromRow)]
-struct OwnerChairRow {
-    id: String,
-    name: String,
-    model: String,
-}
-
-#[derive(Debug, sqlx::FromRow)]
-struct CompletedRideRow {
-    chair_id: String,
-    pickup_latitude: i32,
-    pickup_longitude: i32,
-    destination_latitude: i32,
-    destination_longitude: i32,
+fn sales_until(until_millis: Option<i64>) -> DateTime<Utc> {
+    if let Some(until) = until_millis.and_then(DateTime::from_timestamp_millis) {
+        // Official impl: `updated_at BETWEEN ? AND ? + INTERVAL 999 MICROSECOND`
+        // because completed_at is unix millis (microseconds truncated).
+        return until + chrono::Duration::microseconds(999);
+    }
+    NaiveDate::from_ymd_opt(9999, 12, 31)
+        .unwrap()
+        .and_hms_opt(23, 59, 59)
+        .unwrap()
+        .and_utc()
 }
 
 async fn owner_get_sales(
@@ -115,96 +110,33 @@ async fn owner_get_sales(
     axum::Extension(owner): axum::Extension<Owner>,
     Query(query): Query<GetOwnerSalesQuery>,
 ) -> Result<axum::Json<OwnerGetSalesResponse>, Error> {
-    let since = if let Some(since) = query.since {
-        DateTime::from_timestamp_millis(since).unwrap()
-    } else {
-        DateTime::from_timestamp_millis(0).unwrap()
-    };
-    // Prepare: since+until dump window. Load: only `until` (last completed);
-    // use now so clock skew cannot drop rows the bench already counted.
-    let until = match (query.since, query.until) {
-        (Some(_), Some(until)) => {
-            DateTime::from_timestamp_millis(until).unwrap()
-                + chrono::Duration::microseconds(999)
-        }
-        _ => Utc::now() + chrono::Duration::seconds(1),
-    };
+    let since = query
+        .since
+        .and_then(DateTime::from_timestamp_millis)
+        .unwrap_or_else(|| DateTime::from_timestamp_millis(0).unwrap());
+    let until = sales_until(query.until);
 
-    let chairs: Vec<OwnerChairRow> =
-        sqlx::query_as("SELECT id, name, model FROM chairs WHERE owner_id = ?")
-            .bind(&owner.id)
-            .fetch_all(&state.pool)
-            .await?;
+    let (total, chair_sales, by_model) = state
+        .world
+        .read()
+        .unwrap()
+        .owner_sales(&owner.id, since, until);
 
-    let rides: Vec<CompletedRideRow> = if query.since.is_some() && query.until.is_some() {
-        sqlx::query_as(
-            r#"SELECT r.chair_id, r.pickup_latitude, r.pickup_longitude, r.destination_latitude, r.destination_longitude
-               FROM rides r
-               INNER JOIN chairs c ON c.id = r.chair_id
-               WHERE c.owner_id = ?
-                 AND r.evaluation IS NOT NULL
-                 AND r.updated_at BETWEEN ? AND ? + INTERVAL 999 MICROSECOND"#,
-        )
-        .bind(&owner.id)
-        .bind(since)
-        .bind(until)
-        .fetch_all(&state.pool)
-        .await?
-    } else {
-        sqlx::query_as(
-            r#"SELECT r.chair_id, r.pickup_latitude, r.pickup_longitude, r.destination_latitude, r.destination_longitude
-               FROM rides r
-               INNER JOIN chairs c ON c.id = r.chair_id
-               WHERE c.owner_id = ?
-                 AND r.evaluation IS NOT NULL"#,
-        )
-        .bind(&owner.id)
-        .fetch_all(&state.pool)
-        .await?
-    };
-
-    let mut sales_by_chair: HashMap<String, i32> = HashMap::new();
-    for ride in rides {
-        *sales_by_chair.entry(ride.chair_id).or_insert(0) += crate::calculate_fare(
-            ride.pickup_latitude,
-            ride.pickup_longitude,
-            ride.destination_latitude,
-            ride.destination_longitude,
-        );
-    }
-
-    let mut res = OwnerGetSalesResponse {
-        total_sales: 0,
-        chairs: Vec::with_capacity(chairs.len()),
-        models: Vec::new(),
-    };
-    let mut model_sales_by_model: HashMap<String, i32> = HashMap::new();
-    for chair in chairs {
-        let sales = sales_by_chair.get(&chair.id).copied().unwrap_or(0);
-        res.total_sales += sales;
-        res.chairs.push(ChairSales {
-            id: chair.id,
-            name: chair.name,
-            sales,
-        });
-        *model_sales_by_model.entry(chair.model).or_insert(0) += sales;
-    }
-    for (model, sales) in model_sales_by_model {
-        res.models.push(ModelSales { model, sales });
-    }
-
-    Ok(axum::Json(res))
-}
-
-#[derive(Debug, sqlx::FromRow)]
-struct ChairWithDetail {
-    id: String,
-    name: String,
-    model: String,
-    is_active: bool,
-    created_at: DateTime<Utc>,
-    total_distance: i64,
-    total_distance_updated_at: Option<DateTime<Utc>>,
+    Ok(axum::Json(OwnerGetSalesResponse {
+        total_sales: total,
+        chairs: chair_sales
+            .into_iter()
+            .map(|(chair, sales)| ChairSales {
+                id: chair.id,
+                name: chair.name,
+                sales,
+            })
+            .collect(),
+        models: by_model
+            .into_iter()
+            .map(|(model, sales)| ModelSales { model, sales })
+            .collect(),
+    }))
 }
 
 #[derive(Debug, serde::Serialize)]

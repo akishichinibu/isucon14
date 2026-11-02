@@ -40,14 +40,22 @@ async fn match_inner(state: &AppState) -> Result<(), Error> {
     };
 
     for (ride_id, chair_id, hint) in assignments {
-        let result = sqlx::query("UPDATE rides SET chair_id = ? WHERE id = ? AND chair_id IS NULL")
+        let result = sqlx::query(
+            "UPDATE rides SET chair_id = ?, updated_at = updated_at WHERE id = ? AND chair_id IS NULL",
+        )
             .bind(&chair_id)
             .bind(&ride_id)
             .execute(&state.pool)
             .await?;
         if result.rows_affected() == 0 {
-            // Lost the race; free the chair in memory.
             let mut world = state.world.write().unwrap();
+            let already_taken = world.rides.get(&ride_id).map(|r| {
+                r.status == "COMPLETED" || r.chair_id.is_some()
+            }).unwrap_or(false);
+            if already_taken {
+                // Evaluate (or a previous match) already wrote chair_id.
+                continue;
+            }
             if let Some(c) = world.chairs.get_mut(&chair_id) {
                 if c.current_ride
                     .as_ref()

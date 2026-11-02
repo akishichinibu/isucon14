@@ -88,7 +88,7 @@ pub async fn insert_ride_status(
         .bind(status)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("UPDATE rides SET latest_status = ? WHERE id = ?")
+    sqlx::query("UPDATE rides SET latest_status = ?, updated_at = updated_at WHERE id = ?")
         .bind(status)
         .bind(ride_id)
         .execute(&mut *tx)

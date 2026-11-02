@@ -187,6 +187,11 @@ impl World {
 
     pub fn assign(&mut self, ride_id: &str, chair_id: &str, hint: ChairRideHint) {
         self.unmatched.retain(|r| r.id != ride_id);
+        if let Some(ride) = self.rides.get(ride_id) {
+            if ride.status == "COMPLETED" || ride.chair_id.is_some() {
+                return;
+            }
+        }
         if let Some(ride) = self.rides.get_mut(ride_id) {
             ride.chair_id = Some(chair_id.to_string());
             ride.updated_at = Utc::now();
@@ -200,33 +205,56 @@ impl World {
         // push_status also enqueues chair MATCHING.
     }
 
-    pub fn complete_ride(&mut self, chair_id: &str, evaluation: i32) {
-        let ride_id = self
-            .chairs
-            .get(chair_id)
-            .and_then(|c| c.current_ride.as_ref().map(|r| r.ride_id.clone()));
-        let fare = ride_id
-            .as_ref()
-            .and_then(|rid| {
-                self.rides.get(rid).map(|r| {
-                    crate::calculate_fare(
-                        r.pickup_latitude,
-                        r.pickup_longitude,
-                        r.destination_latitude,
-                        r.destination_longitude,
-                    )
-                })
+    pub fn complete_ride(
+        &mut self,
+        ride_id: &str,
+        chair_id: Option<&str>,
+        evaluation: i32,
+        completed_at: DateTime<Utc>,
+    ) {
+        let chair_id = chair_id
+            .map(str::to_string)
+            .or_else(|| self.rides.get(ride_id).and_then(|r| r.chair_id.clone()));
+        let fare = self
+            .rides
+            .get(ride_id)
+            .map(|r| {
+                crate::calculate_fare(
+                    r.pickup_latitude,
+                    r.pickup_longitude,
+                    r.destination_latitude,
+                    r.destination_longitude,
+                )
             })
             .unwrap_or(0);
-        if let Some(rid) = ride_id {
-            self.push_status(&rid, "COMPLETED");
+        if let Some(cid) = chair_id.as_ref() {
+            if let Some(ride) = self.rides.get_mut(ride_id) {
+                if ride.chair_id.is_none() {
+                    ride.chair_id = Some(cid.clone());
+                }
+            }
         }
-        if let Some(c) = self.chairs.get_mut(chair_id) {
-            c.current_ride = None;
-            c.completed_unsent = true;
-            c.total_rides_count += 1;
-            c.total_evaluation_sum += evaluation;
-            c.accrued_sales += fare;
+        self.push_status(ride_id, "COMPLETED");
+        // Match evaluate's completed_at (rides.updated_at). Sales until-filter
+        // uses this timestamp; Utc::now() here is later and drops the last ride.
+        if let Some(ride) = self.rides.get_mut(ride_id) {
+            ride.updated_at = completed_at;
+            ride.status = "COMPLETED".to_string();
+        }
+        if let Some(cid) = chair_id {
+            if let Some(c) = self.chairs.get_mut(&cid) {
+                if c.current_ride
+                    .as_ref()
+                    .map(|h| h.ride_id == ride_id)
+                    .unwrap_or(true)
+                {
+                    c.current_ride = None;
+                    c.completed_unsent = true;
+                }
+                c.total_rides_count += 1;
+                c.total_evaluation_sum += evaluation;
+                c.accrued_sales += fare;
+            }
         }
     }
 
@@ -288,6 +316,7 @@ impl World {
                     return false;
                 }
                 c.current_ride.is_none()
+                    && !c.completed_unsent
                     && calculate_distance(lat, lng, c.latitude.unwrap(), c.longitude.unwrap())
                         <= distance
             })
@@ -308,8 +337,11 @@ impl World {
         owner_id: &str,
         since: DateTime<Utc>,
         until: DateTime<Utc>,
-        use_accrued: bool,
-    ) -> (i32, Vec<(ChairMem, i32)>, std::collections::HashMap<String, i32>) {
+    ) -> (
+        i32,
+        Vec<(ChairMem, i32)>,
+        std::collections::HashMap<String, i32>,
+    ) {
         let chairs: Vec<ChairMem> = self
             .chairs
             .values()
@@ -319,26 +351,26 @@ impl World {
         let chair_ids: std::collections::HashSet<String> =
             chairs.iter().map(|c| c.id.clone()).collect();
         let mut by_chair: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
-        if use_accrued {
-            for chair in &chairs {
-                by_chair.insert(chair.id.clone(), chair.accrued_sales);
+        for ride in self.rides.values() {
+            if ride.status != "COMPLETED" {
+                continue;
             }
-        } else {
-            for ride in self.rides.values() {
-                if ride.status != "COMPLETED" {
-                    continue;
-                }
-                if ride.updated_at < since || ride.updated_at > until {
-                    continue;
-                }
-                let Some(cid) = ride.chair_id.as_ref() else {
-                    continue;
-                };
-                if !chair_ids.contains(cid) {
-                    continue;
-                }
-                *by_chair.entry(cid.clone()).or_insert(0) += ride.fare;
+            if ride.updated_at < since || ride.updated_at > until {
+                continue;
             }
+            let Some(cid) = ride.chair_id.as_ref() else {
+                continue;
+            };
+            if !chair_ids.contains(cid) {
+                continue;
+            }
+            // Owner sales are undiscounted (initial + distance), not the user fare.
+            *by_chair.entry(cid.clone()).or_insert(0) += crate::calculate_fare(
+                ride.pickup_latitude,
+                ride.pickup_longitude,
+                ride.destination_latitude,
+                ride.destination_longitude,
+            );
         }
         let mut total = 0;
         let mut chair_sales = Vec::with_capacity(chairs.len());
@@ -358,6 +390,12 @@ impl World {
         }
         let mut assignments = Vec::new();
         let mut used_chairs = std::collections::HashSet::new();
+        self.unmatched.retain(|u| {
+            self.rides
+                .get(&u.id)
+                .map(|r| r.status == "MATCHING" && r.chair_id.is_none())
+                .unwrap_or(false)
+        });
         let pending: Vec<UnmatchedRide> = self.unmatched.iter().cloned().collect();
 
         for ride in pending {

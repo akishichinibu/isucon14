@@ -314,10 +314,6 @@ async fn app_post_rides(
     axum::Extension(user): axum::Extension<User>,
     axum::Json(req): axum::Json<AppPostRidesRequest>,
 ) -> Result<(StatusCode, axum::Json<AppPostRidesResponse>), Error> {
-    let ride_id = Ulid::new().to_string();
-
-    let mut tx = state.pool.begin().await?;
-
     let continuing = state.world.read().unwrap().rides.values().any(|r| {
         r.user_id == user.id && r.status != "COMPLETED"
     });
@@ -325,8 +321,45 @@ async fn app_post_rides(
         return Err(Error::Conflict("ride already exists"));
     }
 
+    let mut last_err: Option<Error> = None;
+    let mut ride_id = String::new();
+    let mut fare = 0;
+    for _ in 0..8 {
+        ride_id = Ulid::new().to_string();
+        match app_post_rides_once(&state, &user, &req, &ride_id).await {
+            Ok(f) => {
+                fare = f;
+                last_err = None;
+                break;
+            }
+            Err(Error::Sqlx(e)) if crate::is_deadlock(&e) => {
+                last_err = Some(Error::Sqlx(e));
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    if let Some(err) = last_err {
+        return Err(err);
+    }
+
+    Ok((
+        StatusCode::ACCEPTED,
+        axum::Json(AppPostRidesResponse { ride_id, fare }),
+    ))
+}
+
+async fn app_post_rides_once(
+    state: &AppState,
+    user: &User,
+    req: &AppPostRidesRequest,
+    ride_id: &str,
+) -> Result<i32, Error> {
+    let mut tx = state.pool.begin().await?;
+
     sqlx::query("INSERT INTO rides (id, user_id, pickup_latitude, pickup_longitude, destination_latitude, destination_longitude, latest_status) VALUES (?, ?, ?, ?, ?, ?, 'MATCHING')")
-        .bind(&ride_id)
+        .bind(ride_id)
         .bind(&user.id)
         .bind(req.pickup_coordinate.latitude)
         .bind(req.pickup_coordinate.longitude)
@@ -409,7 +442,7 @@ async fn app_post_rides(
         let mut world = state.world.write().unwrap();
         let now = chrono::Utc::now();
         world.add_ride(crate::state::RideMem {
-            id: ride_id.clone(),
+            id: ride_id.to_string(),
             user_id: user.id.clone(),
             chair_id: None,
             pickup_latitude: req.pickup_coordinate.latitude,
@@ -422,7 +455,7 @@ async fn app_post_rides(
             updated_at: now,
         });
         world.push_unmatched(crate::state::UnmatchedRide {
-            id: ride_id.clone(),
+            id: ride_id.to_string(),
             pickup_latitude: req.pickup_coordinate.latitude,
             pickup_longitude: req.pickup_coordinate.longitude,
             destination_latitude: req.destination_coordinate.latitude,
@@ -431,12 +464,8 @@ async fn app_post_rides(
         });
     }
 
-    crate::spawn_matching(state);
-
-    Ok((
-        StatusCode::ACCEPTED,
-        axum::Json(AppPostRidesResponse { ride_id, fare }),
-    ))
+    crate::spawn_matching(state.clone());
+    Ok(fare)
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -504,13 +533,31 @@ async fn app_post_ride_evaluation(
 
     let mut tx = state.pool.begin().await?;
 
-    let Some(ride): Option<Ride> = sqlx::query_as("SELECT * FROM rides WHERE id = ?")
+    let Some(mut ride): Option<Ride> = sqlx::query_as("SELECT * FROM rides WHERE id = ?")
         .bind(&ride_id)
         .fetch_optional(&mut *tx)
         .await?
     else {
         return Err(Error::NotFound("ride not found"));
     };
+
+    let mem_chair = state
+        .world
+        .read()
+        .unwrap()
+        .rides
+        .get(&ride_id)
+        .and_then(|r| r.chair_id.clone());
+    if ride.chair_id.is_none() {
+        if let Some(cid) = mem_chair.clone() {
+            sqlx::query("UPDATE rides SET chair_id = ?, updated_at = updated_at WHERE id = ?")
+                .bind(&cid)
+                .bind(&ride_id)
+                .execute(&mut *tx)
+                .await?;
+            ride.chair_id = Some(cid);
+        }
+    }
 
     let arrived = state
         .world
@@ -604,12 +651,19 @@ async fn app_post_ride_evaluation(
 
     tx.commit().await?;
 
-    if let Some(chair_id) = ride.chair_id.as_ref() {
-        state
-            .world
-            .write()
-            .unwrap()
-            .complete_ride(chair_id, req.evaluation);
+    {
+        let mut world = state.world.write().unwrap();
+        let mem_chair = world
+            .rides
+            .get(&ride_id)
+            .and_then(|r| r.chair_id.clone());
+        let chair_id = mem_chair.or(ride.chair_id.clone());
+        world.complete_ride(
+            &ride_id,
+            chair_id.as_deref(),
+            req.evaluation,
+            ride.updated_at,
+        );
     }
     crate::spawn_matching(state);
 
