@@ -1,18 +1,9 @@
-use axum::extract::State;
-use axum::http::StatusCode;
-
+use crate::http::HttpResp;
 use crate::{AppState, Error};
 
-pub fn internal_routes() -> axum::Router<AppState> {
-    axum::Router::new().route(
-        "/api/internal/matching",
-        axum::routing::get(internal_get_matching),
-    )
-}
-
-async fn internal_get_matching(State(state): State<AppState>) -> Result<StatusCode, Error> {
-    run_matching(&state).await?;
-    Ok(StatusCode::NO_CONTENT)
+pub async fn internal_get_matching(state: &AppState) -> Result<HttpResp, Error> {
+    run_matching(state).await?;
+    Ok(HttpResp::empty(204))
 }
 
 pub async fn run_matching(state: &AppState) -> Result<(), Error> {
@@ -43,17 +34,18 @@ async fn match_inner(state: &AppState) -> Result<(), Error> {
         let result = sqlx::query(
             "UPDATE rides SET chair_id = ?, updated_at = updated_at WHERE id = ? AND chair_id IS NULL",
         )
-            .bind(&chair_id)
-            .bind(&ride_id)
-            .execute(&state.pool)
-            .await?;
+        .bind(&chair_id)
+        .bind(&ride_id)
+        .execute(&state.pool)
+        .await?;
         if result.rows_affected() == 0 {
             let mut world = state.world.write().unwrap();
-            let already_taken = world.rides.get(&ride_id).map(|r| {
-                r.status == "COMPLETED" || r.chair_id.is_some()
-            }).unwrap_or(false);
+            let already_taken = world
+                .rides
+                .get(&ride_id)
+                .map(|r| r.status == "COMPLETED" || r.chair_id.is_some())
+                .unwrap_or(false);
             if already_taken {
-                // Evaluate (or a previous match) already wrote chair_id.
                 continue;
             }
             if let Some(c) = world.chairs.get_mut(&chair_id) {

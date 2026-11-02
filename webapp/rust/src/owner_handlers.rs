@@ -1,43 +1,14 @@
-use axum::extract::{Query, State};
-use axum::http::StatusCode;
-use axum_extra::extract::cookie::Cookie;
-use axum_extra::extract::CookieJar;
 use chrono::{DateTime, NaiveDate, Utc};
 
-use crate::models::Owner;
-use crate::{AppState, Error};
+use crate::http::{query_i64, HttpResp};
+use crate::json::Buf;
+use crate::{require_owner, AppState, Error};
 
-pub fn owner_routes(app_state: AppState) -> axum::Router<AppState> {
-    let routes =
-        axum::Router::new().route("/api/owner/owners", axum::routing::post(owner_post_owners));
-
-    let authed_routes = axum::Router::new()
-        .route("/api/owner/sales", axum::routing::get(owner_get_sales))
-        .route("/api/owner/chairs", axum::routing::get(owner_get_chairs))
-        .route_layer(axum::middleware::from_fn_with_state(
-            app_state.clone(),
-            crate::middlewares::owner_auth_middleware,
-        ));
-
-    routes.merge(authed_routes)
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct OwnerPostOwnersRequest {
-    name: String,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct OwnerPostOwnersResponse {
-    id: String,
-    chair_register_token: String,
-}
-
-async fn owner_post_owners(
-    State(AppState { pool, .. }): State<AppState>,
-    jar: CookieJar,
-    axum::Json(req): axum::Json<OwnerPostOwnersRequest>,
-) -> Result<(CookieJar, (StatusCode, axum::Json<OwnerPostOwnersResponse>)), Error> {
+pub async fn owner_post_owners(state: &AppState, body: &[u8]) -> Result<HttpResp, Error> {
+    let name = crate::json::parse_named_string(body, "name")?;
+    if name.is_empty() {
+        return Err(Error::BadRequest("some of required fields(name) are empty"));
+    }
     let owner_id = ulid::Ulid::new().to_string();
     let access_token = crate::secure_random_str(32);
     let chair_register_token = crate::secure_random_str(32);
@@ -46,56 +17,32 @@ async fn owner_post_owners(
         "INSERT INTO owners (id, name, access_token, chair_register_token) VALUES (?, ?, ?, ?)",
     )
     .bind(&owner_id)
-    .bind(req.name)
+    .bind(&name)
     .bind(&access_token)
     .bind(&chair_register_token)
-    .execute(&pool)
+    .execute(&state.pool)
     .await?;
 
-    let jar = jar.add(Cookie::build(("owner_session", access_token)).path("/"));
+    state.world.write().unwrap().remember_owner(
+        owner_id.clone(),
+        name,
+        access_token.clone(),
+        chair_register_token.clone(),
+    );
 
-    Ok((
-        jar,
-        (
-            StatusCode::CREATED,
-            axum::Json(OwnerPostOwnersResponse {
-                id: owner_id,
-                chair_register_token,
-            }),
-        ),
-    ))
-}
-
-#[derive(Debug, serde::Serialize)]
-struct ChairSales {
-    id: String,
-    name: String,
-    sales: i32,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct ModelSales {
-    model: String,
-    sales: i32,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct OwnerGetSalesResponse {
-    total_sales: i32,
-    chairs: Vec<ChairSales>,
-    models: Vec<ModelSales>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct GetOwnerSalesQuery {
-    since: Option<i64>,
-    until: Option<i64>,
+    let mut b = Buf::new();
+    b.obj_open();
+    b.key("id");
+    b.str(&owner_id);
+    b.comma();
+    b.key("chair_register_token");
+    b.str(&chair_register_token);
+    b.obj_close();
+    Ok(HttpResp::json(201, b.into_bytes()).cookie("owner_session", access_token))
 }
 
 fn sales_until(until_millis: Option<i64>) -> DateTime<Utc> {
     if let Some(until) = until_millis.and_then(DateTime::from_timestamp_millis) {
-        // Official impl: `updated_at BETWEEN ? AND ? + INTERVAL 999 MICROSECOND`
-        // because completed_at is unix millis (microseconds truncated).
         return until + chrono::Duration::microseconds(999);
     }
     NaiveDate::from_ymd_opt(9999, 12, 31)
@@ -105,76 +52,103 @@ fn sales_until(until_millis: Option<i64>) -> DateTime<Utc> {
         .and_utc()
 }
 
-async fn owner_get_sales(
-    State(state): State<AppState>,
-    axum::Extension(owner): axum::Extension<Owner>,
-    Query(query): Query<GetOwnerSalesQuery>,
-) -> Result<axum::Json<OwnerGetSalesResponse>, Error> {
-    let since = query
-        .since
+pub async fn owner_get_sales(
+    state: &AppState,
+    token: Option<&str>,
+    query: &[(String, String)],
+) -> Result<HttpResp, Error> {
+    let owner_id = require_owner(state, token).await?;
+    let since = query_i64(query, "since")
         .and_then(DateTime::from_timestamp_millis)
         .unwrap_or_else(|| DateTime::from_timestamp_millis(0).unwrap());
-    let until = sales_until(query.until);
+    let until = sales_until(query_i64(query, "until"));
 
     let (total, chair_sales, by_model) = state
         .world
         .read()
         .unwrap()
-        .owner_sales(&owner.id, since, until);
+        .owner_sales(&owner_id, since, until);
 
-    Ok(axum::Json(OwnerGetSalesResponse {
-        total_sales: total,
-        chairs: chair_sales
-            .into_iter()
-            .map(|(chair, sales)| ChairSales {
-                id: chair.id,
-                name: chair.name,
-                sales,
-            })
-            .collect(),
-        models: by_model
-            .into_iter()
-            .map(|(model, sales)| ModelSales { model, sales })
-            .collect(),
-    }))
+    let mut b = Buf::new();
+    b.obj_open();
+    b.key("total_sales");
+    b.i32(total);
+    b.comma();
+    b.key("chairs");
+    b.arr_open();
+    for (i, (chair, sales)) in chair_sales.iter().enumerate() {
+        if i > 0 {
+            b.comma();
+        }
+        b.obj_open();
+        b.key("id");
+        b.str(&chair.id);
+        b.comma();
+        b.key("name");
+        b.str(&chair.name);
+        b.comma();
+        b.key("sales");
+        b.i32(*sales);
+        b.obj_close();
+    }
+    b.arr_close();
+    b.comma();
+    b.key("models");
+    b.arr_open();
+    for (i, (model, sales)) in by_model.iter().enumerate() {
+        if i > 0 {
+            b.comma();
+        }
+        b.obj_open();
+        b.key("model");
+        b.str(model);
+        b.comma();
+        b.key("sales");
+        b.i32(*sales);
+        b.obj_close();
+    }
+    b.arr_close();
+    b.obj_close();
+    Ok(HttpResp::json(200, b.into_bytes()))
 }
 
-#[derive(Debug, serde::Serialize)]
-struct OwnerGetChairResponse {
-    chairs: Vec<OwnerGetChairResponseChair>,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct OwnerGetChairResponseChair {
-    id: String,
-    name: String,
-    model: String,
-    active: bool,
-    registered_at: i64,
-    total_distance: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    total_distance_updated_at: Option<i64>,
-}
-
-async fn owner_get_chairs(
-    State(state): State<AppState>,
-    axum::Extension(owner): axum::Extension<Owner>,
-) -> Result<axum::Json<OwnerGetChairResponse>, Error> {
-    let chairs = state.world.read().unwrap().owner_chairs(&owner.id);
-    Ok(axum::Json(OwnerGetChairResponse {
-        chairs: chairs
-            .into_iter()
-            .map(|chair| OwnerGetChairResponseChair {
-                id: chair.id,
-                name: chair.name,
-                model: chair.model,
-                active: chair.is_active,
-                registered_at: chair.created_at.timestamp_millis(),
-                total_distance: chair.total_distance as i64,
-                total_distance_updated_at: chair
-                    .total_distance_updated_at
-                    .map(|t| t.timestamp_millis()),
-            })
-            .collect(),
-    }))
+pub async fn owner_get_chairs(state: &AppState, token: Option<&str>) -> Result<HttpResp, Error> {
+    let owner_id = require_owner(state, token).await?;
+    let chairs = state.world.read().unwrap().owner_chairs(&owner_id);
+    let mut b = Buf::new();
+    b.obj_open();
+    b.key("chairs");
+    b.arr_open();
+    for (i, chair) in chairs.iter().enumerate() {
+        if i > 0 {
+            b.comma();
+        }
+        b.obj_open();
+        b.key("id");
+        b.str(&chair.id);
+        b.comma();
+        b.key("name");
+        b.str(&chair.name);
+        b.comma();
+        b.key("model");
+        b.str(&chair.model);
+        b.comma();
+        b.key("active");
+        b.bool(chair.is_active);
+        b.comma();
+        b.key("registered_at");
+        b.i64(chair.created_at.timestamp_millis());
+        b.comma();
+        b.key("total_distance");
+        b.i64(chair.total_distance as i64);
+        if let Some(t) = chair.total_distance_updated_at {
+            b.comma();
+            b.key("total_distance_updated_at");
+            b.i64(t.timestamp_millis());
+        }
+        b.obj_close();
+    }
+    b.arr_close();
+    b.obj_close();
+    Ok(HttpResp::json(200, b.into_bytes()))
 }

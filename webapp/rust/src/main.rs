@@ -1,5 +1,4 @@
-use axum::extract::State;
-use isuride::{AppState, Error};
+use isuride::AppState;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -75,68 +74,12 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let app = axum::Router::new()
-        .route("/api/initialize", axum::routing::post(post_initialize))
-        .merge(isuride::app_handlers::app_routes(app_state.clone()))
-        .merge(isuride::owner_handlers::owner_routes(app_state.clone()))
-        .merge(isuride::chair_handlers::chair_routes(app_state.clone()))
-        .merge(isuride::internal_handlers::internal_routes())
-        .with_state(app_state);
-
     let tcp_listener =
         if let Some(std_listener) = listenfd::ListenFd::from_env().take_tcp_listener(0)? {
             TcpListener::from_std(std_listener)?
         } else {
             TcpListener::bind(&SocketAddr::from(([0, 0, 0, 0], 8080))).await?
         };
-    axum::serve(tcp_listener, app).await?;
-
+    isuride::http::serve(tcp_listener, app_state).await?;
     Ok(())
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct PostInitializeRequest {
-    payment_server: String,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct PostInitializeResponse {
-    language: &'static str,
-}
-
-async fn post_initialize(
-    State(state): State<AppState>,
-    axum::Json(req): axum::Json<PostInitializeRequest>,
-) -> Result<axum::Json<PostInitializeResponse>, Error> {
-    {
-        let mut world = state.world.write().unwrap();
-        world.paused = true;
-        world.chairs.clear();
-        world.unmatched.clear();
-    }
-
-    let output = tokio::process::Command::new("../sql/init.sh")
-        .output()
-        .await?;
-    if !output.status.success() {
-        state.world.write().unwrap().paused = false;
-        return Err(Error::Initialize {
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        });
-    }
-
-    sqlx::query("UPDATE settings SET value = ? WHERE name = 'payment_gateway_url'")
-        .bind(req.payment_server)
-        .execute(&state.pool)
-        .await?;
-
-    let loaded = isuride::state::load_world(&state.pool).await?;
-    {
-        let mut world = state.world.write().unwrap();
-        *world = loaded;
-        world.paused = false;
-    }
-
-    Ok(axum::Json(PostInitializeResponse { language: "rust" }))
 }

@@ -1,76 +1,63 @@
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum_extra::extract::CookieJar;
 use ulid::Ulid;
 
+use crate::http::{query_i32, HttpResp};
+use crate::json::Buf;
 use crate::models::{Coupon, PaymentToken, Ride, User};
 use crate::{
-    discounted_fare, insert_ride_status, AppState, Coordinate, Error, NOTIFICATION_RETRY_AFTER_MS,
+    discounted_fare, insert_ride_status, require_user, AppState, Error, NOTIFICATION_RETRY_AFTER_MS,
 };
 
-pub fn app_routes(app_state: AppState) -> axum::Router<AppState> {
-    let routes = axum::Router::new().route("/api/app/users", axum::routing::post(app_post_users));
+pub async fn post_initialize(state: &AppState, body: &[u8]) -> Result<HttpResp, Error> {
+    let payment_server = crate::json::parse_named_string(body, "payment_server")?;
+    {
+        let mut world = state.world.write().unwrap();
+        world.paused = true;
+        world.chairs.clear();
+        world.unmatched.clear();
+    }
 
-    let authed_routes = axum::Router::new()
-        .route(
-            "/api/app/payment-methods",
-            axum::routing::post(app_post_payment_methods),
-        )
-        .route(
-            "/api/app/rides",
-            axum::routing::get(app_get_rides).post(app_post_rides),
-        )
-        .route(
-            "/api/app/rides/estimated-fare",
-            axum::routing::post(app_post_rides_estimated_fare),
-        )
-        .route(
-            "/api/app/rides/:ride_id/evaluation",
-            axum::routing::post(app_post_ride_evaluation),
-        )
-        .route(
-            "/api/app/notification",
-            axum::routing::get(app_get_notification),
-        )
-        .route(
-            "/api/app/nearby-chairs",
-            axum::routing::get(app_get_nearby_chairs),
-        )
-        .route_layer(axum::middleware::from_fn_with_state(
-            app_state.clone(),
-            crate::middlewares::app_auth_middleware,
-        ));
+    let output = tokio::process::Command::new("../sql/init.sh")
+        .output()
+        .await?;
+    if !output.status.success() {
+        state.world.write().unwrap().paused = false;
+        return Err(Error::Initialize {
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
 
-    routes.merge(authed_routes)
+    sqlx::query("UPDATE settings SET value = ? WHERE name = 'payment_gateway_url'")
+        .bind(&payment_server)
+        .execute(&state.pool)
+        .await?;
+
+    let loaded = crate::state::load_world(&state.pool).await?;
+    {
+        let mut world = state.world.write().unwrap();
+        *world = loaded;
+        world.paused = false;
+    }
+
+    let mut b = Buf::new();
+    b.obj_open();
+    b.key("language");
+    b.str("rust");
+    b.obj_close();
+    Ok(HttpResp::json(200, b.into_bytes()))
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct AppPostUsersRequest {
-    username: String,
-    firstname: String,
-    lastname: String,
-    date_of_birth: String,
-    invitation_code: Option<String>,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct AppPostUsersResponse {
-    id: String,
-    invitation_code: String,
-}
-
-async fn app_post_users(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    axum::Json(req): axum::Json<AppPostUsersRequest>,
-) -> Result<(CookieJar, (StatusCode, axum::Json<AppPostUsersResponse>)), Error> {
+pub async fn app_post_users(state: &AppState, body: &[u8]) -> Result<HttpResp, Error> {
+    let req = crate::json::parse_user_reg(body)?;
     let user_id = Ulid::new().to_string();
     let access_token = crate::secure_random_str(32);
     let invitation_code = crate::secure_random_str(15);
 
     let mut last_err: Option<Error> = None;
     for _ in 0..8 {
-        match app_post_users_once(&state.pool, &req, &user_id, &access_token, &invitation_code).await {
+        match app_post_users_once(&state.pool, &req, &user_id, &access_token, &invitation_code)
+            .await
+        {
             Ok(()) => {
                 last_err = None;
                 break;
@@ -90,26 +77,23 @@ async fn app_post_users(
         user_id.clone(),
         req.firstname.clone(),
         req.lastname.clone(),
+        access_token.clone(),
     );
 
-    let jar = jar.add(
-        axum_extra::extract::cookie::Cookie::build(("app_session", access_token.clone())).path("/"),
-    );
-    return Ok((
-        jar,
-        (
-            StatusCode::CREATED,
-            axum::Json(AppPostUsersResponse {
-                id: user_id,
-                invitation_code,
-            }),
-        ),
-    ));
+    let mut b = Buf::new();
+    b.obj_open();
+    b.key("id");
+    b.str(&user_id);
+    b.comma();
+    b.key("invitation_code");
+    b.str(&invitation_code);
+    b.obj_close();
+    Ok(HttpResp::json(201, b.into_bytes()).cookie("app_session", access_token))
 }
 
 async fn app_post_users_once(
     pool: &sqlx::MySqlPool,
-    req: &AppPostUsersRequest,
+    req: &crate::json::UserReg,
     user_id: &str,
     access_token: &str,
     invitation_code: &str,
@@ -173,48 +157,19 @@ async fn app_post_users_once(
     Ok(())
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct AppPostPaymentMethodsRequest {
-    token: String,
-}
-
-async fn app_post_payment_methods(
-    State(AppState { pool, .. }): State<AppState>,
-    axum::Extension(user): axum::Extension<User>,
-    axum::Json(req): axum::Json<AppPostPaymentMethodsRequest>,
-) -> Result<StatusCode, Error> {
+pub async fn app_post_payment_methods(
+    state: &AppState,
+    token: Option<&str>,
+    body: &[u8],
+) -> Result<HttpResp, Error> {
+    let user_id = require_user(state, token).await?;
+    let pay = crate::json::parse_named_string(body, "token")?;
     sqlx::query("INSERT INTO payment_tokens (user_id, token) VALUES (?, ?)")
-        .bind(user.id)
-        .bind(req.token)
-        .execute(&pool)
+        .bind(&user_id)
+        .bind(&pay)
+        .execute(&state.pool)
         .await?;
-
-    Ok(StatusCode::NO_CONTENT)
-}
-
-#[derive(Debug, serde::Serialize)]
-struct GetAppRidesResponse {
-    rides: Vec<GetAppRidesResponseItem>,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct GetAppRidesResponseItem {
-    id: String,
-    pickup_coordinate: Coordinate,
-    destination_coordinate: Coordinate,
-    chair: GetAppRidesResponseItemChair,
-    fare: i32,
-    evaluation: i32,
-    requested_at: i64,
-    completed_at: i64,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct GetAppRidesResponseItemChair {
-    id: String,
-    owner: String,
-    name: String,
-    model: String,
+    Ok(HttpResp::empty(204))
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -234,10 +189,18 @@ struct CompletedRideItem {
     discount: Option<i32>,
 }
 
-async fn app_get_rides(
-    State(AppState { pool, .. }): State<AppState>,
-    axum::Extension(user): axum::Extension<User>,
-) -> Result<axum::Json<GetAppRidesResponse>, Error> {
+fn coord(b: &mut Buf, lat: i32, lng: i32) {
+    b.obj_open();
+    b.key("latitude");
+    b.i32(lat);
+    b.comma();
+    b.key("longitude");
+    b.i32(lng);
+    b.obj_close();
+}
+
+pub async fn app_get_rides(state: &AppState, token: Option<&str>) -> Result<HttpResp, Error> {
+    let user_id = require_user(state, token).await?;
     let rides: Vec<CompletedRideItem> = sqlx::query_as(
         r#"SELECT r.id,
                   r.pickup_latitude,
@@ -259,64 +222,85 @@ async fn app_get_rides(
            WHERE r.user_id = ? AND r.latest_status = 'COMPLETED'
            ORDER BY r.created_at DESC"#,
     )
-    .bind(&user.id)
-    .fetch_all(&pool)
+    .bind(&user_id)
+    .fetch_all(&state.pool)
     .await?;
 
-    let items = rides
-        .into_iter()
-        .map(|ride| GetAppRidesResponseItem {
-            id: ride.id,
-            pickup_coordinate: Coordinate {
-                latitude: ride.pickup_latitude,
-                longitude: ride.pickup_longitude,
-            },
-            destination_coordinate: Coordinate {
-                latitude: ride.destination_latitude,
-                longitude: ride.destination_longitude,
-            },
-            chair: GetAppRidesResponseItemChair {
-                id: ride.chair_id,
-                owner: ride.owner_name,
-                name: ride.chair_name,
-                model: ride.chair_model,
-            },
-            fare: discounted_fare(
-                ride.pickup_latitude,
-                ride.pickup_longitude,
-                ride.destination_latitude,
-                ride.destination_longitude,
-                ride.discount.unwrap_or(0),
-            ),
-            evaluation: ride.evaluation,
-            requested_at: ride.created_at.timestamp_millis(),
-            completed_at: ride.updated_at.timestamp_millis(),
-        })
-        .collect();
-
-    Ok(axum::Json(GetAppRidesResponse { rides: items }))
+    let mut b = Buf::new();
+    b.obj_open();
+    b.key("rides");
+    b.arr_open();
+    for (i, ride) in rides.iter().enumerate() {
+        if i > 0 {
+            b.comma();
+        }
+        b.obj_open();
+        b.key("id");
+        b.str(&ride.id);
+        b.comma();
+        b.key("pickup_coordinate");
+        coord(&mut b, ride.pickup_latitude, ride.pickup_longitude);
+        b.comma();
+        b.key("destination_coordinate");
+        coord(
+            &mut b,
+            ride.destination_latitude,
+            ride.destination_longitude,
+        );
+        b.comma();
+        b.key("chair");
+        b.obj_open();
+        b.key("id");
+        b.str(&ride.chair_id);
+        b.comma();
+        b.key("owner");
+        b.str(&ride.owner_name);
+        b.comma();
+        b.key("name");
+        b.str(&ride.chair_name);
+        b.comma();
+        b.key("model");
+        b.str(&ride.chair_model);
+        b.obj_close();
+        b.comma();
+        b.key("fare");
+        b.i32(discounted_fare(
+            ride.pickup_latitude,
+            ride.pickup_longitude,
+            ride.destination_latitude,
+            ride.destination_longitude,
+            ride.discount.unwrap_or(0),
+        ));
+        b.comma();
+        b.key("evaluation");
+        b.i32(ride.evaluation);
+        b.comma();
+        b.key("requested_at");
+        b.i64(ride.created_at.timestamp_millis());
+        b.comma();
+        b.key("completed_at");
+        b.i64(ride.updated_at.timestamp_millis());
+        b.obj_close();
+    }
+    b.arr_close();
+    b.obj_close();
+    Ok(HttpResp::json(200, b.into_bytes()))
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct AppPostRidesRequest {
-    pickup_coordinate: Coordinate,
-    destination_coordinate: Coordinate,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct AppPostRidesResponse {
-    ride_id: String,
-    fare: i32,
-}
-
-async fn app_post_rides(
-    State(state): State<AppState>,
-    axum::Extension(user): axum::Extension<User>,
-    axum::Json(req): axum::Json<AppPostRidesRequest>,
-) -> Result<(StatusCode, axum::Json<AppPostRidesResponse>), Error> {
-    let continuing = state.world.read().unwrap().rides.values().any(|r| {
-        r.user_id == user.id && r.status != "COMPLETED"
-    });
+pub async fn app_post_rides(
+    state: &AppState,
+    token: Option<&str>,
+    body: &[u8],
+) -> Result<HttpResp, Error> {
+    let user_id = require_user(state, token).await?;
+    let (plat, plng, dlat, dlng) = crate::json::parse_two_coordinates(body)?;
+    let continuing = state
+        .world
+        .read()
+        .unwrap()
+        .rides
+        .values()
+        .any(|r| r.user_id == user_id && r.status != "COMPLETED");
     if continuing {
         return Err(Error::Conflict("ride already exists"));
     }
@@ -326,7 +310,7 @@ async fn app_post_rides(
     let mut fare = 0;
     for _ in 0..8 {
         ride_id = Ulid::new().to_string();
-        match app_post_rides_once(&state, &user, &req, &ride_id).await {
+        match app_post_rides_once(state, &user_id, plat, plng, dlat, dlng, &ride_id).await {
             Ok(f) => {
                 fare = f;
                 last_err = None;
@@ -344,62 +328,70 @@ async fn app_post_rides(
         return Err(err);
     }
 
-    Ok((
-        StatusCode::ACCEPTED,
-        axum::Json(AppPostRidesResponse { ride_id, fare }),
-    ))
+    let mut b = Buf::new();
+    b.obj_open();
+    b.key("ride_id");
+    b.str(&ride_id);
+    b.comma();
+    b.key("fare");
+    b.i32(fare);
+    b.obj_close();
+    Ok(HttpResp::json(202, b.into_bytes()))
 }
 
 async fn app_post_rides_once(
     state: &AppState,
-    user: &User,
-    req: &AppPostRidesRequest,
+    user_id: &str,
+    plat: i32,
+    plng: i32,
+    dlat: i32,
+    dlng: i32,
     ride_id: &str,
 ) -> Result<i32, Error> {
     let mut tx = state.pool.begin().await?;
 
     sqlx::query("INSERT INTO rides (id, user_id, pickup_latitude, pickup_longitude, destination_latitude, destination_longitude, latest_status) VALUES (?, ?, ?, ?, ?, ?, 'MATCHING')")
         .bind(ride_id)
-        .bind(&user.id)
-        .bind(req.pickup_coordinate.latitude)
-        .bind(req.pickup_coordinate.longitude)
-        .bind(req.destination_coordinate.latitude)
-        .bind(req.destination_coordinate.longitude)
+        .bind(user_id)
+        .bind(plat)
+        .bind(plng)
+        .bind(dlat)
+        .bind(dlng)
         .execute(&mut *tx)
         .await?;
 
     sqlx::query("INSERT INTO ride_statuses (id, ride_id, status) VALUES (?, ?, ?)")
         .bind(Ulid::new().to_string())
-        .bind(&ride_id)
+        .bind(ride_id)
         .bind("MATCHING")
         .execute(&mut *tx)
         .await?;
 
     let ride_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rides WHERE user_id = ?")
-        .bind(&user.id)
+        .bind(user_id)
         .fetch_one(&mut *tx)
         .await?;
 
     if ride_count == 1 {
         let coupon: Option<Coupon> = sqlx::query_as("SELECT * FROM coupons WHERE user_id = ? AND code = 'CP_NEW2024' AND used_by IS NULL FOR UPDATE")
-            .bind(&user.id)
+            .bind(user_id)
             .fetch_optional(&mut *tx)
             .await?;
         if coupon.is_some() {
             sqlx::query("UPDATE coupons SET used_by = ? WHERE user_id = ? AND code = 'CP_NEW2024'")
-                .bind(&ride_id)
-                .bind(&user.id)
+                .bind(ride_id)
+                .bind(user_id)
                 .execute(&mut *tx)
                 .await?;
         } else {
             let coupon: Option<Coupon> = sqlx::query_as("SELECT * FROM coupons WHERE user_id = ? AND used_by IS NULL ORDER BY created_at LIMIT 1 FOR UPDATE")
-                .bind(&user.id)
+                .bind(user_id)
                 .fetch_optional(&mut *tx)
                 .await?;
             if let Some(coupon) = coupon {
                 sqlx::query("UPDATE coupons SET used_by = ? WHERE user_id = ? AND code = ?")
-                    .bind(&ride_id)
-                    .bind(&user.id)
+                    .bind(ride_id)
+                    .bind(user_id)
                     .bind(coupon.code)
                     .execute(&mut *tx)
                     .await?;
@@ -407,13 +399,13 @@ async fn app_post_rides_once(
         }
     } else {
         let coupon: Option<Coupon> = sqlx::query_as("SELECT * FROM coupons WHERE user_id = ? AND used_by IS NULL ORDER BY created_at LIMIT 1 FOR UPDATE")
-                .bind(&user.id)
+                .bind(user_id)
                 .fetch_optional(&mut *tx)
                 .await?;
         if let Some(coupon) = coupon {
             sqlx::query("UPDATE coupons SET used_by = ? WHERE user_id = ? AND code = ?")
-                .bind(&ride_id)
-                .bind(&user.id)
+                .bind(ride_id)
+                .bind(user_id)
                 .bind(coupon.code)
                 .execute(&mut *tx)
                 .await?;
@@ -421,18 +413,18 @@ async fn app_post_rides_once(
     }
 
     let ride: Ride = sqlx::query_as("SELECT * FROM rides WHERE id = ?")
-        .bind(&ride_id)
+        .bind(ride_id)
         .fetch_one(&mut *tx)
         .await?;
 
     let fare = calculate_discounted_fare(
         &mut tx,
-        &user.id,
+        user_id,
         Some(&ride),
-        req.pickup_coordinate.latitude,
-        req.pickup_coordinate.longitude,
-        req.destination_coordinate.latitude,
-        req.destination_coordinate.longitude,
+        plat,
+        plng,
+        dlat,
+        dlng,
     )
     .await?;
 
@@ -443,12 +435,12 @@ async fn app_post_rides_once(
         let now = chrono::Utc::now();
         world.add_ride(crate::state::RideMem {
             id: ride_id.to_string(),
-            user_id: user.id.clone(),
+            user_id: user_id.to_string(),
             chair_id: None,
-            pickup_latitude: req.pickup_coordinate.latitude,
-            pickup_longitude: req.pickup_coordinate.longitude,
-            destination_latitude: req.destination_coordinate.latitude,
-            destination_longitude: req.destination_coordinate.longitude,
+            pickup_latitude: plat,
+            pickup_longitude: plng,
+            destination_latitude: dlat,
+            destination_longitude: dlng,
             status: "MATCHING".to_string(),
             fare,
             created_at: now,
@@ -456,10 +448,10 @@ async fn app_post_rides_once(
         });
         world.push_unmatched(crate::state::UnmatchedRide {
             id: ride_id.to_string(),
-            pickup_latitude: req.pickup_coordinate.latitude,
-            pickup_longitude: req.pickup_coordinate.longitude,
-            destination_latitude: req.destination_coordinate.latitude,
-            destination_longitude: req.destination_coordinate.longitude,
+            pickup_latitude: plat,
+            pickup_longitude: plng,
+            destination_latitude: dlat,
+            destination_longitude: dlng,
             created_at: now,
         });
     }
@@ -468,73 +460,45 @@ async fn app_post_rides_once(
     Ok(fare)
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct AppPostRidesEstimatedFareRequest {
-    pickup_coordinate: Coordinate,
-    destination_coordinate: Coordinate,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct AppPostRidesEstimatedFareResponse {
-    fare: i32,
-    discount: i32,
-}
-
-async fn app_post_rides_estimated_fare(
-    State(AppState { pool, .. }): State<AppState>,
-    axum::Extension(user): axum::Extension<User>,
-    axum::Json(req): axum::Json<AppPostRidesEstimatedFareRequest>,
-) -> Result<axum::Json<AppPostRidesEstimatedFareResponse>, Error> {
-    let mut tx = pool.begin().await?;
-
-    let discounted = calculate_discounted_fare(
-        &mut tx,
-        &user.id,
-        None,
-        req.pickup_coordinate.latitude,
-        req.pickup_coordinate.longitude,
-        req.destination_coordinate.latitude,
-        req.destination_coordinate.longitude,
-    )
-    .await?;
-
+pub async fn app_post_estimated_fare(
+    state: &AppState,
+    token: Option<&str>,
+    body: &[u8],
+) -> Result<HttpResp, Error> {
+    let user_id = require_user(state, token).await?;
+    let (plat, plng, dlat, dlng) = crate::json::parse_two_coordinates(body)?;
+    let mut tx = state.pool.begin().await?;
+    let discounted =
+        calculate_discounted_fare(&mut tx, &user_id, None, plat, plng, dlat, dlng).await?;
     tx.commit().await?;
 
-    Ok(axum::Json(AppPostRidesEstimatedFareResponse {
-        fare: discounted,
-        discount: crate::calculate_fare(
-            req.pickup_coordinate.latitude,
-            req.pickup_coordinate.longitude,
-            req.destination_coordinate.latitude,
-            req.destination_coordinate.longitude,
-        ) - discounted,
-    }))
+    let mut b = Buf::new();
+    b.obj_open();
+    b.key("fare");
+    b.i32(discounted);
+    b.comma();
+    b.key("discount");
+    b.i32(crate::calculate_fare(plat, plng, dlat, dlng) - discounted);
+    b.obj_close();
+    Ok(HttpResp::json(200, b.into_bytes()))
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct AppPostRideEvaluationRequest {
-    evaluation: i32,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct AppPostRideEvaluationResponse {
-    fare: i32,
-    completed_at: i64,
-}
-
-async fn app_post_ride_evaluation(
-    State(state): State<AppState>,
-    Path((ride_id,)): Path<(String,)>,
-    axum::Json(req): axum::Json<AppPostRideEvaluationRequest>,
-) -> Result<axum::Json<AppPostRideEvaluationResponse>, Error> {
-    if req.evaluation < 1 || req.evaluation > 5 {
+pub async fn app_post_ride_evaluation(
+    state: &AppState,
+    token: Option<&str>,
+    ride_id: &str,
+    body: &[u8],
+) -> Result<HttpResp, Error> {
+    let _user_id = require_user(state, token).await?;
+    let evaluation = crate::json::parse_named_i32(body, "evaluation")?;
+    if evaluation < 1 || evaluation > 5 {
         return Err(Error::BadRequest("evaluation must be between 1 and 5"));
     }
 
     let mut tx = state.pool.begin().await?;
 
     let Some(mut ride): Option<Ride> = sqlx::query_as("SELECT * FROM rides WHERE id = ?")
-        .bind(&ride_id)
+        .bind(ride_id)
         .fetch_optional(&mut *tx)
         .await?
     else {
@@ -546,13 +510,13 @@ async fn app_post_ride_evaluation(
         .read()
         .unwrap()
         .rides
-        .get(&ride_id)
+        .get(ride_id)
         .and_then(|r| r.chair_id.clone());
     if ride.chair_id.is_none() {
         if let Some(cid) = mem_chair.clone() {
             sqlx::query("UPDATE rides SET chair_id = ?, updated_at = updated_at WHERE id = ?")
                 .bind(&cid)
-                .bind(&ride_id)
+                .bind(ride_id)
                 .execute(&mut *tx)
                 .await?;
             ride.chair_id = Some(cid);
@@ -564,7 +528,7 @@ async fn app_post_ride_evaluation(
         .read()
         .unwrap()
         .rides
-        .get(&ride_id)
+        .get(ride_id)
         .map(|r| r.status == "ARRIVED")
         .unwrap_or(false)
         || ride.latest_status == "ARRIVED";
@@ -573,29 +537,28 @@ async fn app_post_ride_evaluation(
     }
 
     let result = sqlx::query("UPDATE rides SET evaluation = ? WHERE id = ?")
-        .bind(req.evaluation)
-        .bind(&ride_id)
+        .bind(evaluation)
+        .bind(ride_id)
         .execute(&mut *tx)
         .await?;
-    let count = result.rows_affected();
-    if count == 0 {
+    if result.rows_affected() == 0 {
         return Err(Error::NotFound("ride not found"));
     }
 
-    insert_ride_status(&mut tx, &ride_id, "COMPLETED").await?;
+    insert_ride_status(&mut tx, ride_id, "COMPLETED").await?;
 
     if let Some(chair_id) = ride.chair_id.as_ref() {
         sqlx::query(
             "UPDATE chairs SET total_rides_count = total_rides_count + 1, total_evaluation_sum = total_evaluation_sum + ? WHERE id = ?",
         )
-        .bind(req.evaluation)
+        .bind(evaluation)
         .bind(chair_id)
         .execute(&mut *tx)
         .await?;
     }
 
     let Some(ride): Option<Ride> = sqlx::query_as("SELECT * FROM rides WHERE id = ?")
-        .bind(&ride_id)
+        .bind(ride_id)
         .fetch_optional(&mut *tx)
         .await?
     else {
@@ -655,106 +618,79 @@ async fn app_post_ride_evaluation(
         let mut world = state.world.write().unwrap();
         let mem_chair = world
             .rides
-            .get(&ride_id)
+            .get(ride_id)
             .and_then(|r| r.chair_id.clone());
         let chair_id = mem_chair.or(ride.chair_id.clone());
-        world.complete_ride(
-            &ride_id,
-            chair_id.as_deref(),
-            req.evaluation,
-            ride.updated_at,
-        );
+        world.complete_ride(ride_id, chair_id.as_deref(), evaluation, ride.updated_at);
     }
-    crate::spawn_matching(state);
+    crate::spawn_matching(state.clone());
 
-    Ok(axum::Json(AppPostRideEvaluationResponse {
-        fare,
-        completed_at: ride.updated_at.timestamp_millis(),
-    }))
+    let mut b = Buf::new();
+    b.obj_open();
+    b.key("fare");
+    b.i32(fare);
+    b.comma();
+    b.key("completed_at");
+    b.i64(ride.updated_at.timestamp_millis());
+    b.obj_close();
+    Ok(HttpResp::json(200, b.into_bytes()))
 }
 
-#[derive(Debug, serde::Serialize)]
-struct AppGetNotificationResponse {
-    data: Option<AppGetNotificationResponseData>,
-    retry_after_ms: i32,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct AppGetNotificationResponseData {
-    ride_id: String,
-    pickup_coordinate: Coordinate,
-    destination_coordinate: Coordinate,
-    fare: i32,
-    status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    chair: Option<AppGetNotificationResponseChair>,
-    created_at: i64,
-    updated_at: i64,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct AppGetNotificationResponseChair {
-    id: String,
-    name: String,
-    model: String,
-    stats: AppGetNotificationResponseChairStats,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct AppGetNotificationResponseChairStats {
-    total_rides_count: i32,
-    total_evaluation_avg: f64,
-}
-
-#[derive(Debug, sqlx::FromRow)]
-struct ChairStatsRow {
-    id: String,
-    name: String,
-    model: String,
-    total_rides_count: i32,
-    total_evaluation_sum: i32,
-}
-
-async fn app_get_notification(
-    State(state): State<AppState>,
-    axum::Extension(user): axum::Extension<User>,
-) -> Result<axum::Json<AppGetNotificationResponse>, Error> {
+pub async fn app_get_notification(
+    state: &AppState,
+    token: Option<&str>,
+) -> Result<HttpResp, Error> {
+    let user_id = require_user(state, token).await?;
     let ev = {
-        let mut world = state.world.write().unwrap();
+        let world = state.world.read().unwrap();
         world
-            .pop_app_event(&user.id)
-            .or_else(|| world.peek_app_snapshot(&user.id))
+            .pop_app_event(&user_id)
+            .or_else(|| world.peek_app_snapshot(&user_id))
     };
+    let mut b = Buf::new();
+    b.obj_open();
+    b.key("data");
     let Some(ev) = ev else {
-        return Ok(axum::Json(AppGetNotificationResponse {
-            data: None,
-            retry_after_ms: NOTIFICATION_RETRY_AFTER_MS,
-        }));
+        b.null();
+        b.comma();
+        b.key("retry_after_ms");
+        b.i32(NOTIFICATION_RETRY_AFTER_MS);
+        b.obj_close();
+        return Ok(HttpResp::json(200, b.into_bytes()));
     };
 
     let world = state.world.read().unwrap();
     let Some(ride) = world.rides.get(&ev.ride_id) else {
-        return Ok(axum::Json(AppGetNotificationResponse {
-            data: None,
-            retry_after_ms: NOTIFICATION_RETRY_AFTER_MS,
-        }));
+        drop(world);
+        let mut b = Buf::new();
+        b.obj_open();
+        b.key("data");
+        b.null();
+        b.comma();
+        b.key("retry_after_ms");
+        b.i32(NOTIFICATION_RETRY_AFTER_MS);
+        b.obj_close();
+        return Ok(HttpResp::json(200, b.into_bytes()));
     };
-    let mut data = AppGetNotificationResponseData {
-        ride_id: ride.id.clone(),
-        pickup_coordinate: Coordinate {
-            latitude: ride.pickup_latitude,
-            longitude: ride.pickup_longitude,
-        },
-        destination_coordinate: Coordinate {
-            latitude: ride.destination_latitude,
-            longitude: ride.destination_longitude,
-        },
-        fare: ride.fare,
-        status: ev.status,
-        chair: None,
-        created_at: ride.created_at.timestamp_millis(),
-        updated_at: ride.updated_at.timestamp_millis(),
-    };
+    b.obj_open();
+    b.key("ride_id");
+    b.str(&ride.id);
+    b.comma();
+    b.key("pickup_coordinate");
+    coord(&mut b, ride.pickup_latitude, ride.pickup_longitude);
+    b.comma();
+    b.key("destination_coordinate");
+    coord(
+        &mut b,
+        ride.destination_latitude,
+        ride.destination_longitude,
+    );
+    b.comma();
+    b.key("fare");
+    b.i32(ride.fare);
+    b.comma();
+    b.key("status");
+    b.str(&ev.status);
     if let Some(chair_id) = ride.chair_id.as_ref() {
         if let Some(chair) = world.chairs.get(chair_id) {
             let avg = if chair.total_rides_count > 0 {
@@ -762,82 +698,92 @@ async fn app_get_notification(
             } else {
                 0.0
             };
-            data.chair = Some(AppGetNotificationResponseChair {
-                id: chair.id.clone(),
-                name: chair.name.clone(),
-                model: chair.model.clone(),
-                stats: AppGetNotificationResponseChairStats {
-                    total_rides_count: chair.total_rides_count,
-                    total_evaluation_avg: avg,
-                },
-            });
+            b.comma();
+            b.key("chair");
+            b.obj_open();
+            b.key("id");
+            b.str(&chair.id);
+            b.comma();
+            b.key("name");
+            b.str(&chair.name);
+            b.comma();
+            b.key("model");
+            b.str(&chair.model);
+            b.comma();
+            b.key("stats");
+            b.obj_open();
+            b.key("total_rides_count");
+            b.i32(chair.total_rides_count);
+            b.comma();
+            b.key("total_evaluation_avg");
+            b.f64(avg);
+            b.obj_close();
+            b.obj_close();
         }
     }
+    b.comma();
+    b.key("created_at");
+    b.i64(ride.created_at.timestamp_millis());
+    b.comma();
+    b.key("updated_at");
+    b.i64(ride.updated_at.timestamp_millis());
+    b.obj_close();
     drop(world);
-
-    Ok(axum::Json(AppGetNotificationResponse {
-        data: Some(data),
-        retry_after_ms: NOTIFICATION_RETRY_AFTER_MS,
-    }))
+    b.comma();
+    b.key("retry_after_ms");
+    b.i32(NOTIFICATION_RETRY_AFTER_MS);
+    b.obj_close();
+    Ok(HttpResp::json(200, b.into_bytes()))
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct AppGetNearbyChairsQuery {
-    latitude: i32,
-    longitude: i32,
-    distance: Option<i32>,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct AppGetNearbyChairsResponse {
-    chairs: Vec<AppGetNearbyChairsResponseChair>,
-    retrieved_at: i64,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct AppGetNearbyChairsResponseChair {
-    id: String,
-    name: String,
-    model: String,
-    current_coordinate: Coordinate,
-}
-
-#[derive(Debug, sqlx::FromRow)]
-struct NearbyChairRow {
-    id: String,
-    name: String,
-    model: String,
-    latitude: i32,
-    longitude: i32,
-}
-
-async fn app_get_nearby_chairs(
-    State(state): State<AppState>,
-    Query(query): Query<AppGetNearbyChairsQuery>,
-) -> Result<axum::Json<AppGetNearbyChairsResponse>, Error> {
-    let distance = query.distance.unwrap_or(50);
+pub async fn app_get_nearby_chairs(
+    state: &AppState,
+    token: Option<&str>,
+    query: &[(String, String)],
+) -> Result<HttpResp, Error> {
+    let _user_id = require_user(state, token).await?;
+    let latitude = query_i32(query, "latitude").ok_or(Error::BadRequest("latitude required"))?;
+    let longitude = query_i32(query, "longitude").ok_or(Error::BadRequest("longitude required"))?;
+    let distance = query_i32(query, "distance").unwrap_or(50);
     let chairs = state
         .world
         .read()
         .unwrap()
-        .nearby(query.latitude, query.longitude, distance);
+        .nearby(latitude, longitude, distance);
     let retrieved_at = chrono::Utc::now();
 
-    Ok(axum::Json(AppGetNearbyChairsResponse {
-        chairs: chairs
-            .into_iter()
-            .map(|chair| AppGetNearbyChairsResponseChair {
-                id: chair.id,
-                name: chair.name,
-                model: chair.model,
-                current_coordinate: Coordinate {
-                    latitude: chair.latitude.unwrap_or(0),
-                    longitude: chair.longitude.unwrap_or(0),
-                },
-            })
-            .collect(),
-        retrieved_at: retrieved_at.timestamp_millis(),
-    }))
+    let mut b = Buf::new();
+    b.obj_open();
+    b.key("chairs");
+    b.arr_open();
+    for (i, chair) in chairs.iter().enumerate() {
+        if i > 0 {
+            b.comma();
+        }
+        b.obj_open();
+        b.key("id");
+        b.str(&chair.id);
+        b.comma();
+        b.key("name");
+        b.str(&chair.name);
+        b.comma();
+        b.key("model");
+        b.str(&chair.model);
+        b.comma();
+        b.key("current_coordinate");
+        coord(
+            &mut b,
+            chair.latitude.unwrap_or(0),
+            chair.longitude.unwrap_or(0),
+        );
+        b.obj_close();
+    }
+    b.arr_close();
+    b.comma();
+    b.key("retrieved_at");
+    b.i64(retrieved_at.timestamp_millis());
+    b.obj_close();
+    Ok(HttpResp::json(200, b.into_bytes()))
 }
 
 async fn calculate_discounted_fare(

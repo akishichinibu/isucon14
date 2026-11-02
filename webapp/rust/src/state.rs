@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 
@@ -15,7 +16,7 @@ pub struct ChairRideHint {
     pub status: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ChairMem {
     pub id: String,
     pub owner_id: String,
@@ -29,10 +30,33 @@ pub struct ChairMem {
     pub total_distance: i32,
     pub total_distance_updated_at: Option<DateTime<Utc>>,
     pub current_ride: Option<ChairRideHint>,
-    pub completed_unsent: bool,
+    pub completed_unsent: AtomicBool,
     pub total_rides_count: i32,
     pub total_evaluation_sum: i32,
     pub accrued_sales: i32,
+}
+
+impl Clone for ChairMem {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            owner_id: self.owner_id.clone(),
+            name: self.name.clone(),
+            model: self.model.clone(),
+            speed: self.speed,
+            is_active: self.is_active,
+            created_at: self.created_at,
+            latitude: self.latitude,
+            longitude: self.longitude,
+            total_distance: self.total_distance,
+            total_distance_updated_at: self.total_distance_updated_at,
+            current_ride: self.current_ride.clone(),
+            completed_unsent: AtomicBool::new(self.completed_unsent.load(Ordering::Relaxed)),
+            total_rides_count: self.total_rides_count,
+            total_evaluation_sum: self.total_evaluation_sum,
+            accrued_sales: self.accrued_sales,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +96,12 @@ pub struct UserMem {
     pub lastname: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct OwnerMem {
+    pub id: String,
+    pub name: String,
+}
+
 #[derive(Debug, Default)]
 pub struct World {
     pub paused: bool,
@@ -79,17 +109,46 @@ pub struct World {
     pub unmatched: VecDeque<UnmatchedRide>,
     pub rides: HashMap<String, RideMem>,
     pub users: HashMap<String, UserMem>,
-    pub app_notify: HashMap<String, VecDeque<StatusEvent>>,
-    pub chair_notify: HashMap<String, VecDeque<StatusEvent>>,
+    pub owners: HashMap<String, OwnerMem>,
+    pub app_notify: Mutex<HashMap<String, VecDeque<StatusEvent>>>,
+    pub chair_notify: Mutex<HashMap<String, VecDeque<StatusEvent>>>,
+    pub user_by_token: HashMap<String, String>,
+    pub chair_by_token: HashMap<String, String>,
+    pub owner_by_token: HashMap<String, String>,
+    pub owner_by_register: HashMap<String, String>,
 }
 
 impl World {
-    pub fn remember_user(&mut self, id: String, firstname: String, lastname: String) {
+    pub fn remember_user(&mut self, id: String, firstname: String, lastname: String, token: String) {
+        self.user_by_token.insert(token, id.clone());
         self.users.insert(id, UserMem { firstname, lastname });
     }
 
-    pub fn upsert_chair(&mut self, chair: ChairMem) {
+    pub fn upsert_chair(&mut self, chair: ChairMem, access_token: String) {
+        self.chair_by_token.insert(access_token, chair.id.clone());
         self.chairs.insert(chair.id.clone(), chair);
+    }
+
+    pub fn remember_owner(&mut self, id: String, name: String, token: String, register: String) {
+        self.owner_by_token.insert(token, id.clone());
+        self.owner_by_register.insert(register, id.clone());
+        self.owners.insert(id.clone(), OwnerMem { id, name });
+    }
+
+    pub fn user_id_by_token(&self, token: &str) -> Option<&str> {
+        self.user_by_token.get(token).map(|s| s.as_str())
+    }
+
+    pub fn chair_id_by_token(&self, token: &str) -> Option<&str> {
+        self.chair_by_token.get(token).map(|s| s.as_str())
+    }
+
+    pub fn owner_id_by_token(&self, token: &str) -> Option<&str> {
+        self.owner_by_token.get(token).map(|s| s.as_str())
+    }
+
+    pub fn owner_id_by_register(&self, token: &str) -> Option<&str> {
+        self.owner_by_register.get(token).map(|s| s.as_str())
     }
 
     pub fn update_coord(
@@ -140,6 +199,8 @@ impl World {
 
     pub fn add_ride(&mut self, ride: RideMem) {
         self.app_notify
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .entry(ride.user_id.clone())
             .or_default()
             .push_back(StatusEvent {
@@ -168,6 +229,8 @@ impl World {
             }
         }
         self.app_notify
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .entry(user_id)
             .or_default()
             .push_back(StatusEvent {
@@ -176,6 +239,8 @@ impl World {
             });
         if let Some(cid) = chair_id {
             self.chair_notify
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
                 .entry(cid)
                 .or_default()
                 .push_back(StatusEvent {
@@ -198,7 +263,7 @@ impl World {
         }
         if let Some(c) = self.chairs.get_mut(chair_id) {
             c.current_ride = Some(hint.clone());
-            c.completed_unsent = false;
+            c.completed_unsent.store(false, Ordering::Relaxed);
         }
         // User already has MATCHING; push again so the payload includes the chair.
         self.push_status(ride_id, "MATCHING");
@@ -249,7 +314,7 @@ impl World {
                     .unwrap_or(true)
                 {
                     c.current_ride = None;
-                    c.completed_unsent = true;
+                    c.completed_unsent.store(true, Ordering::Relaxed);
                 }
                 c.total_rides_count += 1;
                 c.total_evaluation_sum += evaluation;
@@ -258,15 +323,17 @@ impl World {
         }
     }
 
-    pub fn mark_completed_sent(&mut self, chair_id: &str) {
-        if let Some(c) = self.chairs.get_mut(chair_id) {
-            c.completed_unsent = false;
+    pub fn mark_completed_sent(&self, chair_id: &str) {
+        if let Some(c) = self.chairs.get(chair_id) {
+            c.completed_unsent.store(false, Ordering::Relaxed);
         }
     }
 
-    pub fn pop_chair_event(&mut self, chair_id: &str) -> Option<StatusEvent> {
-        let q = self.chair_notify.get_mut(chair_id)?;
-        let ev = q.pop_front()?;
+    pub fn pop_chair_event(&self, chair_id: &str) -> Option<StatusEvent> {
+        let ev = {
+            let mut map = self.chair_notify.lock().unwrap_or_else(|e| e.into_inner());
+            map.get_mut(chair_id)?.pop_front()
+        }?;
         if ev.status == "COMPLETED" {
             self.mark_completed_sent(chair_id);
         }
@@ -274,9 +341,12 @@ impl World {
     }
 
     pub fn peek_chair_snapshot(&self, chair_id: &str) -> Option<StatusEvent> {
-        if let Some(q) = self.chair_notify.get(chair_id) {
-            if let Some(front) = q.front() {
-                return Some(front.clone());
+        {
+            let map = self.chair_notify.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(q) = map.get(chair_id) {
+                if let Some(front) = q.front() {
+                    return Some(front.clone());
+                }
             }
         }
         self.chairs
@@ -288,14 +358,21 @@ impl World {
             })
     }
 
-    pub fn pop_app_event(&mut self, user_id: &str) -> Option<StatusEvent> {
-        self.app_notify.get_mut(user_id)?.pop_front()
+    pub fn pop_app_event(&self, user_id: &str) -> Option<StatusEvent> {
+        self.app_notify
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(user_id)?
+            .pop_front()
     }
 
     pub fn peek_app_snapshot(&self, user_id: &str) -> Option<StatusEvent> {
-        if let Some(q) = self.app_notify.get(user_id) {
-            if let Some(front) = q.front() {
-                return Some(front.clone());
+        {
+            let map = self.app_notify.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(q) = map.get(user_id) {
+                if let Some(front) = q.front() {
+                    return Some(front.clone());
+                }
             }
         }
         self.rides
@@ -316,7 +393,7 @@ impl World {
                     return false;
                 }
                 c.current_ride.is_none()
-                    && !c.completed_unsent
+                    && !c.completed_unsent.load(Ordering::Relaxed)
                     && calculate_distance(lat, lng, c.latitude.unwrap(), c.longitude.unwrap())
                         <= distance
             })
@@ -404,7 +481,7 @@ impl World {
                 if used_chairs.contains(&chair.id)
                     || !chair.is_active
                     || chair.current_ride.is_some()
-                    || chair.completed_unsent
+                    || chair.completed_unsent.load(Ordering::Relaxed)
                     || chair.speed <= 0
                 {
                     continue;
@@ -448,7 +525,7 @@ impl World {
     }
 }
 
-pub type SharedWorld = std::sync::Arc<RwLock<World>>;
+pub type SharedWorld = std::sync::Arc<std::sync::RwLock<World>>;
 
 #[derive(Debug, sqlx::FromRow)]
 struct ChairRow {
@@ -465,6 +542,7 @@ struct ChairRow {
     speed: Option<i32>,
     total_rides_count: Option<i32>,
     total_evaluation_sum: Option<i32>,
+    access_token: String,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -486,6 +564,15 @@ struct UserRow {
     id: String,
     firstname: String,
     lastname: String,
+    access_token: String,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct OwnerRow {
+    id: String,
+    name: String,
+    access_token: String,
+    chair_register_token: String,
 }
 
 pub async fn load_world(pool: &sqlx::MySqlPool) -> sqlx::Result<World> {
@@ -494,7 +581,8 @@ pub async fn load_world(pool: &sqlx::MySqlPool) -> sqlx::Result<World> {
                   c.latitude, c.longitude, c.total_distance, c.total_distance_updated_at,
                   cm.speed AS speed,
                   c.total_rides_count AS total_rides_count,
-                  c.total_evaluation_sum AS total_evaluation_sum
+                  c.total_evaluation_sum AS total_evaluation_sum,
+                  c.access_token AS access_token
            FROM chairs c
            LEFT JOIN chair_models cm ON cm.name = c.model"#,
     )
@@ -510,23 +598,24 @@ pub async fn load_world(pool: &sqlx::MySqlPool) -> sqlx::Result<World> {
     .await?;
 
     let users: Vec<UserRow> =
-        sqlx::query_as("SELECT id, firstname, lastname FROM users")
+        sqlx::query_as("SELECT id, firstname, lastname, access_token FROM users")
             .fetch_all(pool)
             .await?;
+    let owners: Vec<OwnerRow> = sqlx::query_as(
+        "SELECT id, name, access_token, chair_register_token FROM owners",
+    )
+    .fetch_all(pool)
+    .await?;
 
     let mut world = World::default();
     for u in users {
-        world.users.insert(
-            u.id,
-            UserMem {
-                firstname: u.firstname,
-                lastname: u.lastname,
-            },
-        );
+        world.remember_user(u.id, u.firstname, u.lastname, u.access_token);
+    }
+    for o in owners {
+        world.remember_owner(o.id, o.name, o.access_token, o.chair_register_token);
     }
     for row in rows {
-        world.chairs.insert(
-            row.id.clone(),
+        world.upsert_chair(
             ChairMem {
                 id: row.id,
                 owner_id: row.owner_id,
@@ -540,11 +629,12 @@ pub async fn load_world(pool: &sqlx::MySqlPool) -> sqlx::Result<World> {
                 total_distance: row.total_distance,
                 total_distance_updated_at: row.total_distance_updated_at,
                 current_ride: None,
-                completed_unsent: false,
+                completed_unsent: AtomicBool::new(false),
                 total_rides_count: row.total_rides_count.unwrap_or(0),
                 total_evaluation_sum: row.total_evaluation_sum.unwrap_or(0),
                 accrued_sales: 0,
             },
+            row.access_token,
         );
     }
 

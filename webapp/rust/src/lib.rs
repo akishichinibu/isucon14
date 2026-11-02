@@ -1,4 +1,3 @@
-use axum::{http::StatusCode, response::Response};
 use std::sync::Arc;
 use ulid::Ulid;
 
@@ -29,34 +28,44 @@ pub enum Error {
     #[error("{0}")]
     Conflict(&'static str),
 }
-impl axum::response::IntoResponse for Error {
-    fn into_response(self) -> Response {
-        let status = match self {
-            Self::BadRequest(_) => StatusCode::BAD_REQUEST,
-            Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
-            Self::NotFound(_) => StatusCode::NOT_FOUND,
-            Self::Conflict(_) => StatusCode::CONFLICT,
-            Self::PaymentGateway(_) => StatusCode::BAD_GATEWAY,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        };
 
-        #[derive(Debug, serde::Serialize)]
-        struct ErrorBody {
-            message: String,
-        }
-        let message = self.to_string();
-        if status.is_server_error() {
-            tracing::error!("{message}");
-        }
-
-        (status, axum::Json(ErrorBody { message })).into_response()
-    }
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy)]
 pub struct Coordinate {
     pub latitude: i32,
     pub longitude: i32,
+}
+
+pub async fn require_user(state: &AppState, token: Option<&str>) -> Result<String, Error> {
+    let t = token.ok_or(Error::Unauthorized("app_session cookie is required"))?;
+    state
+        .world
+        .read()
+        .unwrap()
+        .user_id_by_token(t)
+        .map(str::to_string)
+        .ok_or(Error::Unauthorized("invalid access token"))
+}
+
+pub async fn require_chair(state: &AppState, token: Option<&str>) -> Result<String, Error> {
+    let t = token.ok_or(Error::Unauthorized("chair_session cookie is required"))?;
+    state
+        .world
+        .read()
+        .unwrap()
+        .chair_id_by_token(t)
+        .map(str::to_string)
+        .ok_or(Error::Unauthorized("invalid access token"))
+}
+
+pub async fn require_owner(state: &AppState, token: Option<&str>) -> Result<String, Error> {
+    let t = token.ok_or(Error::Unauthorized("owner_session cookie is required"))?;
+    state
+        .world
+        .read()
+        .unwrap()
+        .owner_id_by_token(t)
+        .map(str::to_string)
+        .ok_or(Error::Unauthorized("invalid access token"))
 }
 
 pub fn secure_random_str(b: usize) -> String {
@@ -65,16 +74,6 @@ pub fn secure_random_str(b: usize) -> String {
     let mut rng = rand::thread_rng();
     rng.fill_bytes(&mut buf);
     hex::encode(&buf)
-}
-
-pub async fn get_latest_ride_status<'e, E>(executor: E, ride_id: &str) -> sqlx::Result<String>
-where
-    E: 'e + sqlx::Executor<'e, Database = sqlx::MySql>,
-{
-    sqlx::query_scalar("SELECT latest_status FROM rides WHERE id = ?")
-        .bind(ride_id)
-        .fetch_one(executor)
-        .await
 }
 
 pub async fn insert_ride_status(
@@ -114,7 +113,6 @@ pub fn is_deadlock(err: &sqlx::Error) -> bool {
         .unwrap_or(false)
 }
 
-// Manhattan distance
 pub fn calculate_distance(
     a_latitude: i32,
     a_longitude: i32,
@@ -164,8 +162,9 @@ pub const NOTIFICATION_RETRY_AFTER_MS: i32 = 30;
 
 pub mod app_handlers;
 pub mod chair_handlers;
+pub mod http;
 pub mod internal_handlers;
-pub mod middlewares;
+pub mod json;
 pub mod models;
 pub mod owner_handlers;
 pub mod payment_gateway;
