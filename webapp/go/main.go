@@ -167,6 +167,7 @@ func postInitialize(w http.ResponseWriter, r *http.Request) {
 	}
 
 	clearAuthCaches()
+	clearMatchingCaches()
 
 	writeJSON(w, http.StatusOK, postInitializeResponse{Language: "go"})
 }

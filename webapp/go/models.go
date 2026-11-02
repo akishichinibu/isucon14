@@ -6,14 +6,18 @@ import (
 )
 
 type Chair struct {
-	ID          string    `db:"id"`
-	OwnerID     string    `db:"owner_id"`
-	Name        string    `db:"name"`
-	Model       string    `db:"model"`
-	IsActive    bool      `db:"is_active"`
-	AccessToken string    `db:"access_token"`
-	CreatedAt   time.Time `db:"created_at"`
-	UpdatedAt   time.Time `db:"updated_at"`
+	ID                      string       `db:"id"`
+	OwnerID                 string       `db:"owner_id"`
+	Name                    string       `db:"name"`
+	Model                   string       `db:"model"`
+	IsActive                bool         `db:"is_active"`
+	AccessToken             string       `db:"access_token"`
+	CreatedAt               time.Time    `db:"created_at"`
+	UpdatedAt               time.Time    `db:"updated_at"`
+	Latitude                sql.NullInt64 `db:"latitude"`
+	Longitude               sql.NullInt64 `db:"longitude"`
+	TotalDistance           int           `db:"total_distance"`
+	TotalDistanceUpdatedAt  sql.NullTime  `db:"total_distance_updated_at"`
 }
 
 type ChairModel struct {
@@ -27,6 +31,14 @@ type ChairLocation struct {
 	Latitude  int       `db:"latitude"`
 	Longitude int       `db:"longitude"`
 	CreatedAt time.Time `db:"created_at"`
+}
+
+// ChairLatest is the in-memory last known chair position used by matching.
+type ChairLatest struct {
+	Latitude      int
+	Longitude     int
+	TotalDistance int
+	UpdatedAt     time.Time
 }
 
 type User struct {
@@ -58,6 +70,7 @@ type Ride struct {
 	Evaluation           *int           `db:"evaluation"`
 	CreatedAt            time.Time      `db:"created_at"`
 	UpdatedAt            time.Time      `db:"updated_at"`
+	LatestStatus         sql.NullString `db:"latest_status"`
 }
 
 type RideStatus struct {
