@@ -29,6 +29,14 @@ type ChairLocation struct {
 	CreatedAt time.Time `db:"created_at"`
 }
 
+// ChairLatest is the in-memory last known chair position used by matching.
+type ChairLatest struct {
+	Latitude      int
+	Longitude     int
+	TotalDistance int
+	UpdatedAt     time.Time
+}
+
 type User struct {
 	ID             string    `db:"id"`
 	Username       string    `db:"username"`

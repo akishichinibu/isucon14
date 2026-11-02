@@ -1,13 +1,69 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
+	"time"
 
 	"github.com/oklog/ulid/v2"
 )
+
+type chairRideHint struct {
+	hasRide              bool
+	RideID               string
+	PickupLatitude       int
+	PickupLongitude      int
+	DestinationLatitude  int
+	DestinationLongitude int
+}
+
+var (
+	chairPosMu sync.RWMutex
+	chairPos   = map[string]ChairLatest{}
+
+	chairRideMu sync.RWMutex
+	chairRide   = map[string]chairRideHint{}
+)
+
+func rememberChairPos(chairID string, lat, lon int, at time.Time) {
+	chairPosMu.Lock()
+	prev, ok := chairPos[chairID]
+	dist := 0
+	if ok {
+		dist = prev.TotalDistance + abs(lat-prev.Latitude) + abs(lon-prev.Longitude)
+	}
+	chairPos[chairID] = ChairLatest{
+		Latitude:      lat,
+		Longitude:     lon,
+		TotalDistance: dist,
+		UpdatedAt:     at,
+	}
+	chairPosMu.Unlock()
+}
+
+func getChairPos(chairID string) (ChairLatest, bool) {
+	chairPosMu.RLock()
+	pos, ok := chairPos[chairID]
+	chairPosMu.RUnlock()
+	return pos, ok
+}
+
+func rememberChairRide(chairID string, hint chairRideHint) {
+	chairRideMu.Lock()
+	chairRide[chairID] = hint
+	chairRideMu.Unlock()
+}
+
+func getChairRideHint(chairID string) (chairRideHint, bool) {
+	chairRideMu.RLock()
+	hint, ok := chairRide[chairID]
+	chairRideMu.RUnlock()
+	return hint, ok
+}
 
 type chairPostChairsRequest struct {
 	Name               string `json:"name"`
@@ -103,67 +159,107 @@ func chairPostCoordinate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	chair := ctx.Value("chair").(*Chair)
+	now := time.Now()
+	// Wall-clock DATETIME so ordering matches MySQL CURRENT_TIMESTAMP / initial data.
+	createdAt := now.Format("2006-01-02 15:04:05.000000")
 
-	tx, err := db.Beginx()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	defer tx.Rollback()
-
-	chairLocationID := ulid.Make().String()
-	if _, err := tx.ExecContext(
+	if _, err := db.ExecContext(
 		ctx,
-		`INSERT INTO chair_locations (id, chair_id, latitude, longitude) VALUES (?, ?, ?, ?)`,
-		chairLocationID, chair.ID, req.Latitude, req.Longitude,
+		`INSERT INTO chair_locations (id, chair_id, latitude, longitude, created_at) VALUES (?, ?, ?, ?, ?)`,
+		ulid.Make().String(), chair.ID, req.Latitude, req.Longitude, createdAt,
 	); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	rememberChairPos(chair.ID, req.Latitude, req.Longitude, now)
 
-	location := &ChairLocation{}
-	if err := tx.GetContext(ctx, location, `SELECT * FROM chair_locations WHERE id = ?`, chairLocationID); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-
-	ride := &Ride{}
-	if err := tx.GetContext(ctx, ride, `SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC LIMIT 1`, chair.ID); err != nil {
-		if !errors.Is(err, sql.ErrNoRows) {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-	} else {
-		status, err := getLatestRideStatus(ctx, tx, ride.ID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		if status != "COMPLETED" && status != "CANCELED" {
-			if req.Latitude == ride.PickupLatitude && req.Longitude == ride.PickupLongitude && status == "ENROUTE" {
-				if _, err := tx.ExecContext(ctx, "INSERT INTO ride_statuses (id, ride_id, status) VALUES (?, ?, ?)", ulid.Make().String(), ride.ID, "PICKUP"); err != nil {
-					writeError(w, http.StatusInternalServerError, err)
-					return
-				}
-			}
-
-			if req.Latitude == ride.DestinationLatitude && req.Longitude == ride.DestinationLongitude && status == "CARRYING" {
-				if _, err := tx.ExecContext(ctx, "INSERT INTO ride_statuses (id, ride_id, status) VALUES (?, ?, ?)", ulid.Make().String(), ride.ID, "ARRIVED"); err != nil {
-					writeError(w, http.StatusInternalServerError, err)
-					return
-				}
-			}
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
+	if err := maybeArriveAtRidePoint(ctx, chair.ID, req); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 
 	writeJSON(w, http.StatusOK, &chairPostCoordinateResponse{
-		RecordedAt: location.CreatedAt.UnixMilli(),
+		RecordedAt: now.UnixMilli(),
 	})
+}
+
+type currentChairRide struct {
+	ID                   string `db:"id"`
+	PickupLatitude       int    `db:"pickup_latitude"`
+	PickupLongitude      int    `db:"pickup_longitude"`
+	DestinationLatitude  int    `db:"destination_latitude"`
+	DestinationLongitude int    `db:"destination_longitude"`
+	Status               string `db:"status"`
+}
+
+func shouldCheckRideStatus(chairID string, coord *Coordinate) bool {
+	hint, ok := getChairRideHint(chairID)
+	if !ok {
+		return true
+	}
+	if !hint.hasRide {
+		return false
+	}
+	if coord.Latitude == hint.PickupLatitude && coord.Longitude == hint.PickupLongitude {
+		return true
+	}
+	if coord.Latitude == hint.DestinationLatitude && coord.Longitude == hint.DestinationLongitude {
+		return true
+	}
+	return false
+}
+
+func maybeArriveAtRidePoint(ctx context.Context, chairID string, coord *Coordinate) error {
+	if !shouldCheckRideStatus(chairID, coord) {
+		return nil
+	}
+
+	ride := currentChairRide{}
+	err := db.GetContext(ctx, &ride, `
+SELECT r.id, r.pickup_latitude, r.pickup_longitude, r.destination_latitude, r.destination_longitude,
+       (SELECT rs.status FROM ride_statuses rs WHERE rs.ride_id = r.id ORDER BY rs.created_at DESC LIMIT 1) AS status
+FROM rides r
+WHERE r.chair_id = ?
+ORDER BY r.updated_at DESC
+LIMIT 1`, chairID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			rememberChairRide(chairID, chairRideHint{})
+			return nil
+		}
+		return err
+	}
+
+	if ride.Status == "COMPLETED" || ride.Status == "CANCELED" {
+		hint, ok := getChairRideHint(chairID)
+		if !ok || !hint.hasRide || hint.RideID == "" || hint.RideID == ride.ID {
+			rememberChairRide(chairID, chairRideHint{})
+		}
+		return nil
+	}
+
+	rememberChairRide(chairID, chairRideHint{
+		hasRide:              true,
+		RideID:               ride.ID,
+		PickupLatitude:       ride.PickupLatitude,
+		PickupLongitude:      ride.PickupLongitude,
+		DestinationLatitude:  ride.DestinationLatitude,
+		DestinationLongitude: ride.DestinationLongitude,
+	})
+
+	if coord.Latitude == ride.PickupLatitude && coord.Longitude == ride.PickupLongitude && ride.Status == "ENROUTE" {
+		if _, err := db.ExecContext(ctx, "INSERT INTO ride_statuses (id, ride_id, status) VALUES (?, ?, ?)", ulid.Make().String(), ride.ID, "PICKUP"); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	if coord.Latitude == ride.DestinationLatitude && coord.Longitude == ride.DestinationLongitude && ride.Status == "CARRYING" {
+		if _, err := db.ExecContext(ctx, "INSERT INTO ride_statuses (id, ride_id, status) VALUES (?, ?, ?)", ulid.Make().String(), ride.ID, "ARRIVED"); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type simpleUser struct {
