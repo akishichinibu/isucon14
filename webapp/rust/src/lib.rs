@@ -160,7 +160,7 @@ pub fn discounted_fare(
     INITIAL_FARE + std::cmp::max(metered_fare - discount, 0)
 }
 
-pub const NOTIFICATION_RETRY_AFTER_MS: i32 = 100;
+pub const NOTIFICATION_RETRY_AFTER_MS: i32 = 30;
 
 pub mod app_handlers;
 pub mod chair_handlers;

@@ -30,6 +30,8 @@ pub struct ChairMem {
     pub total_distance_updated_at: Option<DateTime<Utc>>,
     pub current_ride: Option<ChairRideHint>,
     pub completed_unsent: bool,
+    pub total_rides_count: i32,
+    pub total_evaluation_sum: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -42,19 +44,60 @@ pub struct UnmatchedRide {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RideMem {
+    pub id: String,
+    pub user_id: String,
+    pub chair_id: Option<String>,
+    pub pickup_latitude: i32,
+    pub pickup_longitude: i32,
+    pub destination_latitude: i32,
+    pub destination_longitude: i32,
+    pub status: String,
+    pub fare: i32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StatusEvent {
+    pub ride_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserMem {
+    pub firstname: String,
+    pub lastname: String,
+}
+
 #[derive(Debug, Default)]
 pub struct World {
     pub paused: bool,
     pub chairs: HashMap<String, ChairMem>,
     pub unmatched: VecDeque<UnmatchedRide>,
+    pub rides: HashMap<String, RideMem>,
+    pub users: HashMap<String, UserMem>,
+    pub app_notify: HashMap<String, VecDeque<StatusEvent>>,
+    pub chair_notify: HashMap<String, VecDeque<StatusEvent>>,
 }
 
 impl World {
+    pub fn remember_user(&mut self, id: String, firstname: String, lastname: String) {
+        self.users.insert(id, UserMem { firstname, lastname });
+    }
+
     pub fn upsert_chair(&mut self, chair: ChairMem) {
         self.chairs.insert(chair.id.clone(), chair);
     }
 
-    pub fn update_coord(&mut self, chair_id: &str, lat: i32, lng: i32, at: DateTime<Utc>) -> Option<ChairRideHint> {
+    pub fn update_coord(
+        &mut self,
+        chair_id: &str,
+        lat: i32,
+        lng: i32,
+        at: DateTime<Utc>,
+    ) -> Option<ChairRideHint> {
         let chair = self.chairs.get_mut(chair_id)?;
         if let (Some(prev_lat), Some(prev_lng)) = (chair.latitude, chair.longitude) {
             chair.total_distance += calculate_distance(prev_lat, prev_lng, lat, lng);
@@ -65,19 +108,21 @@ impl World {
 
         let hint = chair.current_ride.clone()?;
         if hint.status == "ENROUTE" && lat == hint.pickup_latitude && lng == hint.pickup_longitude {
-            if let Some(ride) = chair.current_ride.as_mut() {
-                ride.status = "PICKUP".to_string();
-            }
-            return chair.current_ride.clone();
+            self.push_status(&hint.ride_id, "PICKUP");
+            return self
+                .chairs
+                .get(chair_id)
+                .and_then(|c| c.current_ride.clone());
         }
         if hint.status == "CARRYING"
             && lat == hint.destination_latitude
             && lng == hint.destination_longitude
         {
-            if let Some(ride) = chair.current_ride.as_mut() {
-                ride.status = "ARRIVED".to_string();
-            }
-            return chair.current_ride.clone();
+            self.push_status(&hint.ride_id, "ARRIVED");
+            return self
+                .chairs
+                .get(chair_id)
+                .and_then(|c| c.current_ride.clone());
         }
         None
     }
@@ -92,18 +137,81 @@ impl World {
         self.unmatched.push_back(ride);
     }
 
-    pub fn assign(&mut self, ride_id: &str, chair_id: &str, hint: ChairRideHint) {
-        self.unmatched.retain(|r| r.id != ride_id);
-        if let Some(c) = self.chairs.get_mut(chair_id) {
-            c.current_ride = Some(hint);
-            c.completed_unsent = false;
+    pub fn add_ride(&mut self, ride: RideMem) {
+        self.app_notify
+            .entry(ride.user_id.clone())
+            .or_default()
+            .push_back(StatusEvent {
+                ride_id: ride.id.clone(),
+                status: ride.status.clone(),
+            });
+        self.rides.insert(ride.id.clone(), ride);
+    }
+
+    pub fn push_status(&mut self, ride_id: &str, status: &str) {
+        let now = Utc::now();
+        let Some(ride) = self.rides.get_mut(ride_id) else {
+            return;
+        };
+        ride.status = status.to_string();
+        ride.updated_at = now;
+        let user_id = ride.user_id.clone();
+        let chair_id = ride.chair_id.clone();
+        if let Some(cid) = &chair_id {
+            if let Some(c) = self.chairs.get_mut(cid) {
+                if let Some(cur) = c.current_ride.as_mut() {
+                    if cur.ride_id == ride_id {
+                        cur.status = status.to_string();
+                    }
+                }
+            }
+        }
+        self.app_notify
+            .entry(user_id)
+            .or_default()
+            .push_back(StatusEvent {
+                ride_id: ride_id.to_string(),
+                status: status.to_string(),
+            });
+        if let Some(cid) = chair_id {
+            self.chair_notify
+                .entry(cid)
+                .or_default()
+                .push_back(StatusEvent {
+                    ride_id: ride_id.to_string(),
+                    status: status.to_string(),
+                });
         }
     }
 
-    pub fn complete_ride(&mut self, chair_id: &str) {
+    pub fn assign(&mut self, ride_id: &str, chair_id: &str, hint: ChairRideHint) {
+        self.unmatched.retain(|r| r.id != ride_id);
+        if let Some(ride) = self.rides.get_mut(ride_id) {
+            ride.chair_id = Some(chair_id.to_string());
+            ride.updated_at = Utc::now();
+        }
+        if let Some(c) = self.chairs.get_mut(chair_id) {
+            c.current_ride = Some(hint.clone());
+            c.completed_unsent = false;
+        }
+        // User already has MATCHING; push again so the payload includes the chair.
+        self.push_status(ride_id, "MATCHING");
+        // push_status also enqueues chair MATCHING.
+    }
+
+    pub fn complete_ride(&mut self, chair_id: &str, evaluation: i32) {
+        let ride_id = self
+            .chairs
+            .get(chair_id)
+            .and_then(|c| c.current_ride.as_ref().map(|r| r.ride_id.clone()));
+        if let Some(rid) = ride_id {
+            self.push_status(&rid, "COMPLETED");
+        }
         if let Some(c) = self.chairs.get_mut(chair_id) {
             c.current_ride = None;
             c.completed_unsent = true;
+            c.total_rides_count += 1;
+            c.total_evaluation_sum += evaluation;
         }
     }
 
@@ -113,15 +221,58 @@ impl World {
         }
     }
 
+    pub fn pop_chair_event(&mut self, chair_id: &str) -> Option<StatusEvent> {
+        let q = self.chair_notify.get_mut(chair_id)?;
+        let ev = q.pop_front()?;
+        if ev.status == "COMPLETED" {
+            self.mark_completed_sent(chair_id);
+        }
+        Some(ev)
+    }
+
+    pub fn peek_chair_snapshot(&self, chair_id: &str) -> Option<StatusEvent> {
+        if let Some(q) = self.chair_notify.get(chair_id) {
+            if let Some(front) = q.front() {
+                return Some(front.clone());
+            }
+        }
+        self.chairs
+            .get(chair_id)
+            .and_then(|c| c.current_ride.as_ref())
+            .map(|h| StatusEvent {
+                ride_id: h.ride_id.clone(),
+                status: h.status.clone(),
+            })
+    }
+
+    pub fn pop_app_event(&mut self, user_id: &str) -> Option<StatusEvent> {
+        self.app_notify.get_mut(user_id)?.pop_front()
+    }
+
+    pub fn peek_app_snapshot(&self, user_id: &str) -> Option<StatusEvent> {
+        if let Some(q) = self.app_notify.get(user_id) {
+            if let Some(front) = q.front() {
+                return Some(front.clone());
+            }
+        }
+        self.rides
+            .values()
+            .filter(|r| r.user_id == user_id)
+            .max_by_key(|r| r.created_at)
+            .map(|r| StatusEvent {
+                ride_id: r.id.clone(),
+                status: r.status.clone(),
+            })
+    }
+
     pub fn nearby(&self, lat: i32, lng: i32, distance: i32) -> Vec<ChairMem> {
         self.chairs
             .values()
             .filter(|c| {
-                // Same rule as the reference SQL: active, has a position, not on an open ride.
-                c.is_active
-                    && c.current_ride.is_none()
-                    && c.latitude.is_some()
-                    && c.longitude.is_some()
+                if !c.is_active || c.latitude.is_none() || c.longitude.is_none() {
+                    return false;
+                }
+                c.current_ride.is_none()
                     && calculate_distance(lat, lng, c.latitude.unwrap(), c.longitude.unwrap())
                         <= distance
             })
@@ -137,7 +288,6 @@ impl World {
             .collect()
     }
 
-    /// Greedy ETA matching. Returns (ride_id, chair_id, hint).
     pub fn match_once(&mut self) -> Vec<(String, String, ChairRideHint)> {
         if self.paused {
             return Vec::new();
@@ -147,7 +297,7 @@ impl World {
         let pending: Vec<UnmatchedRide> = self.unmatched.iter().cloned().collect();
 
         for ride in pending {
-            let mut best: Option<(String, i32, i32)> = None; // chair_id, dist, speed
+            let mut best: Option<(String, i32, i32)> = None;
             for chair in self.chairs.values() {
                 if used_chairs.contains(&chair.id)
                     || !chair.is_active
@@ -211,11 +361,14 @@ struct ChairRow {
     total_distance: i32,
     total_distance_updated_at: Option<DateTime<Utc>>,
     speed: Option<i32>,
+    total_rides_count: Option<i32>,
+    total_evaluation_sum: Option<i32>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
 struct RideRow {
     id: String,
+    user_id: String,
     chair_id: Option<String>,
     pickup_latitude: i32,
     pickup_longitude: i32,
@@ -225,11 +378,20 @@ struct RideRow {
     created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct UserRow {
+    id: String,
+    firstname: String,
+    lastname: String,
+}
+
 pub async fn load_world(pool: &sqlx::MySqlPool) -> sqlx::Result<World> {
     let rows: Vec<ChairRow> = sqlx::query_as(
         r#"SELECT c.id, c.owner_id, c.name, c.model, c.is_active, c.created_at,
                   c.latitude, c.longitude, c.total_distance, c.total_distance_updated_at,
-                  cm.speed AS speed
+                  cm.speed AS speed,
+                  c.total_rides_count AS total_rides_count,
+                  c.total_evaluation_sum AS total_evaluation_sum
            FROM chairs c
            LEFT JOIN chair_models cm ON cm.name = c.model"#,
     )
@@ -237,7 +399,7 @@ pub async fn load_world(pool: &sqlx::MySqlPool) -> sqlx::Result<World> {
     .await?;
 
     let rides: Vec<RideRow> = sqlx::query_as(
-        r#"SELECT id, chair_id, pickup_latitude, pickup_longitude,
+        r#"SELECT id, user_id, chair_id, pickup_latitude, pickup_longitude,
                   destination_latitude, destination_longitude, latest_status, created_at
            FROM rides
            WHERE chair_id IS NULL OR latest_status <> 'COMPLETED'"#,
@@ -245,7 +407,21 @@ pub async fn load_world(pool: &sqlx::MySqlPool) -> sqlx::Result<World> {
     .fetch_all(pool)
     .await?;
 
+    let users: Vec<UserRow> =
+        sqlx::query_as("SELECT id, firstname, lastname FROM users")
+            .fetch_all(pool)
+            .await?;
+
     let mut world = World::default();
+    for u in users {
+        world.users.insert(
+            u.id,
+            UserMem {
+                firstname: u.firstname,
+                lastname: u.lastname,
+            },
+        );
+    }
     for row in rows {
         world.chairs.insert(
             row.id.clone(),
@@ -263,11 +439,31 @@ pub async fn load_world(pool: &sqlx::MySqlPool) -> sqlx::Result<World> {
                 total_distance_updated_at: row.total_distance_updated_at,
                 current_ride: None,
                 completed_unsent: false,
+                total_rides_count: row.total_rides_count.unwrap_or(0),
+                total_evaluation_sum: row.total_evaluation_sum.unwrap_or(0),
             },
         );
     }
 
     for ride in rides {
+        let mem = RideMem {
+            id: ride.id.clone(),
+            user_id: ride.user_id.clone(),
+            chair_id: ride.chair_id.clone(),
+            pickup_latitude: ride.pickup_latitude,
+            pickup_longitude: ride.pickup_longitude,
+            destination_latitude: ride.destination_latitude,
+            destination_longitude: ride.destination_longitude,
+            status: ride.latest_status.clone(),
+            fare: crate::calculate_fare(
+                ride.pickup_latitude,
+                ride.pickup_longitude,
+                ride.destination_latitude,
+                ride.destination_longitude,
+            ),
+            created_at: ride.created_at,
+            updated_at: ride.created_at,
+        };
         if let Some(chair_id) = &ride.chair_id {
             if ride.latest_status != "COMPLETED" {
                 if let Some(c) = world.chairs.get_mut(chair_id) {
@@ -283,7 +479,7 @@ pub async fn load_world(pool: &sqlx::MySqlPool) -> sqlx::Result<World> {
             }
         } else {
             world.unmatched.push_back(UnmatchedRide {
-                id: ride.id,
+                id: ride.id.clone(),
                 pickup_latitude: ride.pickup_latitude,
                 pickup_longitude: ride.pickup_longitude,
                 destination_latitude: ride.destination_latitude,
@@ -291,7 +487,25 @@ pub async fn load_world(pool: &sqlx::MySqlPool) -> sqlx::Result<World> {
                 created_at: ride.created_at,
             });
         }
+        world.rides.insert(ride.id, mem);
     }
 
     Ok(world)
+}
+
+pub fn persist_status(pool: sqlx::MySqlPool, ride_id: String, status: String) {
+    tokio::spawn(async move {
+        let id = ulid::Ulid::new().to_string();
+        let _ = sqlx::query("INSERT INTO ride_statuses (id, ride_id, status) VALUES (?, ?, ?)")
+            .bind(&id)
+            .bind(&ride_id)
+            .bind(&status)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("UPDATE rides SET latest_status = ?, updated_at = updated_at WHERE id = ?")
+            .bind(&status)
+            .bind(&ride_id)
+            .execute(&pool)
+            .await;
+    });
 }

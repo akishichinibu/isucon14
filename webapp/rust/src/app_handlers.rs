@@ -60,7 +60,7 @@ struct AppPostUsersResponse {
 }
 
 async fn app_post_users(
-    State(AppState { pool, .. }): State<AppState>,
+    State(state): State<AppState>,
     jar: CookieJar,
     axum::Json(req): axum::Json<AppPostUsersRequest>,
 ) -> Result<(CookieJar, (StatusCode, axum::Json<AppPostUsersResponse>)), Error> {
@@ -70,7 +70,7 @@ async fn app_post_users(
 
     let mut last_err: Option<Error> = None;
     for _ in 0..8 {
-        match app_post_users_once(&pool, &req, &user_id, &access_token, &invitation_code).await {
+        match app_post_users_once(&state.pool, &req, &user_id, &access_token, &invitation_code).await {
             Ok(()) => {
                 last_err = None;
                 break;
@@ -86,6 +86,11 @@ async fn app_post_users(
     if let Some(err) = last_err {
         return Err(err);
     }
+    state.world.write().unwrap().remember_user(
+        user_id.clone(),
+        req.firstname.clone(),
+        req.lastname.clone(),
+    );
 
     let jar = jar.add(
         axum_extra::extract::cookie::Cookie::build(("app_session", access_token.clone())).path("/"),
@@ -404,14 +409,31 @@ async fn app_post_rides(
 
     tx.commit().await?;
 
-    state.world.write().unwrap().push_unmatched(crate::state::UnmatchedRide {
-        id: ride_id.clone(),
-        pickup_latitude: req.pickup_coordinate.latitude,
-        pickup_longitude: req.pickup_coordinate.longitude,
-        destination_latitude: req.destination_coordinate.latitude,
-        destination_longitude: req.destination_coordinate.longitude,
-        created_at: chrono::Utc::now(),
-    });
+    {
+        let mut world = state.world.write().unwrap();
+        let now = chrono::Utc::now();
+        world.add_ride(crate::state::RideMem {
+            id: ride_id.clone(),
+            user_id: user.id.clone(),
+            chair_id: None,
+            pickup_latitude: req.pickup_coordinate.latitude,
+            pickup_longitude: req.pickup_coordinate.longitude,
+            destination_latitude: req.destination_coordinate.latitude,
+            destination_longitude: req.destination_coordinate.longitude,
+            status: "MATCHING".to_string(),
+            fare,
+            created_at: now,
+            updated_at: now,
+        });
+        world.push_unmatched(crate::state::UnmatchedRide {
+            id: ride_id.clone(),
+            pickup_latitude: req.pickup_coordinate.latitude,
+            pickup_longitude: req.pickup_coordinate.longitude,
+            destination_latitude: req.destination_coordinate.latitude,
+            destination_longitude: req.destination_coordinate.longitude,
+            created_at: now,
+        });
+    }
 
     crate::spawn_matching(state);
 
@@ -578,7 +600,11 @@ async fn app_post_ride_evaluation(
     tx.commit().await?;
 
     if let Some(chair_id) = ride.chair_id.as_ref() {
-        state.world.write().unwrap().complete_ride(chair_id);
+        state
+            .world
+            .write()
+            .unwrap()
+            .complete_ride(chair_id, req.evaluation);
     }
     crate::spawn_matching(state);
 
@@ -631,48 +657,31 @@ struct ChairStatsRow {
 }
 
 async fn app_get_notification(
-    State(AppState { pool, .. }): State<AppState>,
+    State(state): State<AppState>,
     axum::Extension(user): axum::Extension<User>,
 ) -> Result<axum::Json<AppGetNotificationResponse>, Error> {
-    let Some(ride): Option<Ride> =
-        sqlx::query_as("SELECT * FROM rides WHERE user_id = ? ORDER BY created_at DESC LIMIT 1")
-            .bind(&user.id)
-            .fetch_optional(&pool)
-            .await?
-    else {
+    let ev = {
+        let mut world = state.world.write().unwrap();
+        world
+            .pop_app_event(&user.id)
+            .or_else(|| world.peek_app_snapshot(&user.id))
+    };
+    let Some(ev) = ev else {
         return Ok(axum::Json(AppGetNotificationResponse {
             data: None,
             retry_after_ms: NOTIFICATION_RETRY_AFTER_MS,
         }));
     };
 
-    let mut tx = pool.begin().await?;
-
-    let yet_sent: Option<(String, String)> = sqlx::query_as(
-        "SELECT id, status FROM ride_statuses WHERE ride_id = ? AND app_sent_at IS NULL ORDER BY created_at ASC LIMIT 1",
-    )
-    .bind(&ride.id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let (ride_status_id, status) = if let Some((id, status)) = yet_sent {
-        (Some(id), status)
-    } else {
-        (None, ride.latest_status.clone())
+    let world = state.world.read().unwrap();
+    let Some(ride) = world.rides.get(&ev.ride_id) else {
+        return Ok(axum::Json(AppGetNotificationResponse {
+            data: None,
+            retry_after_ms: NOTIFICATION_RETRY_AFTER_MS,
+        }));
     };
-
-    let fare = calculate_discounted_fare(
-        &mut tx,
-        &user.id,
-        Some(&ride),
-        ride.pickup_latitude,
-        ride.pickup_longitude,
-        ride.destination_latitude,
-        ride.destination_longitude,
-    )
-    .await?;
-
     let mut data = AppGetNotificationResponseData {
-        ride_id: ride.id,
+        ride_id: ride.id.clone(),
         pickup_coordinate: Coordinate {
             latitude: ride.pickup_latitude,
             longitude: ride.pickup_longitude,
@@ -681,46 +690,31 @@ async fn app_get_notification(
             latitude: ride.destination_latitude,
             longitude: ride.destination_longitude,
         },
-        fare,
-        status,
+        fare: ride.fare,
+        status: ev.status,
         chair: None,
         created_at: ride.created_at.timestamp_millis(),
         updated_at: ride.updated_at.timestamp_millis(),
     };
-
-    if let Some(chair_id) = ride.chair_id {
-        let chair: ChairStatsRow = sqlx::query_as(
-            "SELECT id, name, model, total_rides_count, total_evaluation_sum FROM chairs WHERE id = ?",
-        )
-        .bind(chair_id)
-        .fetch_one(&mut *tx)
-        .await?;
-
-        let total_evaluation_avg = if chair.total_rides_count > 0 {
-            chair.total_evaluation_sum as f64 / chair.total_rides_count as f64
-        } else {
-            0.0
-        };
-
-        data.chair = Some(AppGetNotificationResponseChair {
-            id: chair.id,
-            name: chair.name,
-            model: chair.model,
-            stats: AppGetNotificationResponseChairStats {
-                total_rides_count: chair.total_rides_count,
-                total_evaluation_avg,
-            },
-        });
+    if let Some(chair_id) = ride.chair_id.as_ref() {
+        if let Some(chair) = world.chairs.get(chair_id) {
+            let avg = if chair.total_rides_count > 0 {
+                chair.total_evaluation_sum as f64 / chair.total_rides_count as f64
+            } else {
+                0.0
+            };
+            data.chair = Some(AppGetNotificationResponseChair {
+                id: chair.id.clone(),
+                name: chair.name.clone(),
+                model: chair.model.clone(),
+                stats: AppGetNotificationResponseChairStats {
+                    total_rides_count: chair.total_rides_count,
+                    total_evaluation_avg: avg,
+                },
+            });
+        }
     }
-
-    if let Some(ride_status_id) = ride_status_id {
-        sqlx::query("UPDATE ride_statuses SET app_sent_at = CURRENT_TIMESTAMP(6) WHERE id = ?")
-            .bind(ride_status_id)
-            .execute(&mut *tx)
-            .await?;
-    }
-
-    tx.commit().await?;
+    drop(world);
 
     Ok(axum::Json(AppGetNotificationResponse {
         data: Some(data),
