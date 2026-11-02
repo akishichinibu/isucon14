@@ -32,7 +32,8 @@ INNER JOIN (
 ) loc ON loc.chair_id = c.id
 SET c.latitude = loc.latitude,
     c.longitude = loc.longitude,
-    c.total_distance_updated_at = loc.created_at;
+    c.total_distance_updated_at = loc.created_at,
+    c.updated_at = c.updated_at;
 
 -- Cumulative distance from consecutive location samples
 UPDATE chairs c
@@ -50,7 +51,8 @@ INNER JOIN (
   GROUP BY chair_id
 ) d ON d.chair_id = c.id
 SET c.total_distance = d.total_distance,
-    c.total_distance_updated_at = d.updated_at;
+    c.total_distance_updated_at = d.updated_at,
+    c.updated_at = c.updated_at;
 
 -- Latest ride status
 UPDATE rides r
@@ -63,7 +65,8 @@ INNER JOIN (
     GROUP BY ride_id
   ) t ON t.ride_id = rs.ride_id AND t.max_created_at = rs.created_at
 ) latest ON latest.ride_id = r.id
-SET r.latest_status = latest.status;
+SET r.latest_status = latest.status,
+    r.updated_at = r.updated_at;
 
 -- Chair evaluation stats for completed rides
 UPDATE chairs c
@@ -77,4 +80,5 @@ INNER JOIN (
   GROUP BY chair_id
 ) s ON s.chair_id = c.id
 SET c.total_rides_count = s.cnt,
-    c.total_evaluation_sum = s.eval_sum;
+    c.total_evaluation_sum = s.eval_sum,
+    c.updated_at = c.updated_at;
