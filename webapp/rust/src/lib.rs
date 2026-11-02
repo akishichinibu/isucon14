@@ -7,6 +7,7 @@ pub struct AppState {
     pub matching_lock: Arc<tokio::sync::Mutex<()>>,
     pub world: crate::state::SharedWorld,
     pub matching_enabled: bool,
+    pub static_files: Arc<std::collections::HashMap<String, (String, Vec<u8>)>>,
 }
 
 #[derive(Debug, thiserror::Error)]

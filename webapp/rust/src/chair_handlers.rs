@@ -17,10 +17,13 @@ pub async fn chair_post_chairs(state: &AppState, body: &[u8]) -> Result<HttpResp
 
     let chair_id = Ulid::new().to_string();
     let access_token = crate::secure_random_str(32);
-    let speed: i32 = sqlx::query_scalar("SELECT speed FROM chair_models WHERE name = ?")
-        .bind(&req.model)
-        .fetch_optional(&state.pool)
-        .await?
+    let speed = state
+        .world
+        .read()
+        .unwrap()
+        .model_speed
+        .get(&req.model)
+        .copied()
         .unwrap_or(1);
 
     sqlx::query(

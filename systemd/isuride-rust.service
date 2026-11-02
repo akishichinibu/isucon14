@@ -1,8 +1,6 @@
 [Unit]
 Description=isuride-rust
-After=syslog.target
-After=mysql.service
-Requires=mysql.service
+After=syslog.target network-online.target
 
 [Service]
 WorkingDirectory=/home/isucon/webapp/rust
@@ -10,6 +8,9 @@ EnvironmentFile=/home/isucon/env.sh
 
 User=isucon
 Group=isucon
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+LimitNOFILE=65535
 ExecStart=/home/isucon/webapp/rust/target/release/isuride
 ExecStop=/bin/kill -s TERM $MAINPID
 

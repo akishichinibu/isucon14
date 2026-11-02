@@ -2,10 +2,8 @@ use ulid::Ulid;
 
 use crate::http::{query_i32, HttpResp};
 use crate::json::Buf;
-use crate::models::{Coupon, PaymentToken, Ride, User};
-use crate::{
-    discounted_fare, insert_ride_status, require_user, AppState, Error, NOTIFICATION_RETRY_AFTER_MS,
-};
+use crate::models::{Coupon, User};
+use crate::{require_user, AppState, Error, NOTIFICATION_RETRY_AFTER_MS};
 
 pub async fn post_initialize(state: &AppState, body: &[u8]) -> Result<HttpResp, Error> {
     let payment_server = crate::json::parse_named_string(body, "payment_server")?;
@@ -36,6 +34,7 @@ pub async fn post_initialize(state: &AppState, body: &[u8]) -> Result<HttpResp, 
     {
         let mut world = state.world.write().unwrap();
         *world = loaded;
+        world.payment_gateway_url = payment_server;
         world.paused = false;
     }
 
@@ -53,32 +52,95 @@ pub async fn app_post_users(state: &AppState, body: &[u8]) -> Result<HttpResp, E
     let access_token = crate::secure_random_str(32);
     let invitation_code = crate::secure_random_str(15);
 
-    let mut last_err: Option<Error> = None;
-    for _ in 0..8 {
-        match app_post_users_once(&state.pool, &req, &user_id, &access_token, &invitation_code)
-            .await
-        {
-            Ok(()) => {
-                last_err = None;
-                break;
+    {
+        let mut world = state.world.write().unwrap();
+        if let Some(inv) = req.invitation_code.as_ref() {
+            if !inv.is_empty() {
+                if !world.invitation_by_code.contains_key(inv) {
+                    return Err(Error::BadRequest("この招待コードは使用できません。"));
+                }
+                let inv_code = format!("INV_{inv}");
+                let used = world
+                    .coupons
+                    .values()
+                    .flatten()
+                    .filter(|c| c.code == inv_code)
+                    .count();
+                if used >= 3 {
+                    return Err(Error::BadRequest("この招待コードは使用できません。"));
+                }
             }
-            Err(Error::Sqlx(e)) if crate::is_deadlock(&e) => {
-                last_err = Some(Error::Sqlx(e));
-                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-                continue;
+        }
+        world.remember_user(
+            user_id.clone(),
+            req.firstname.clone(),
+            req.lastname.clone(),
+            access_token.clone(),
+            invitation_code.clone(),
+        );
+        let now = chrono::Utc::now();
+        world.add_coupon(
+            user_id.clone(),
+            crate::state::CouponMem {
+                code: "CP_NEW2024".to_string(),
+                discount: 3000,
+                used_by: None,
+                created_at: now,
+            },
+        );
+        if let Some(inv) = req.invitation_code.as_ref() {
+            if !inv.is_empty() {
+                world.add_coupon(
+                    user_id.clone(),
+                    crate::state::CouponMem {
+                        code: format!("INV_{inv}"),
+                        discount: 1500,
+                        used_by: None,
+                        created_at: now,
+                    },
+                );
+                if let Some(inviter) = world.invitation_by_code.get(inv).cloned() {
+                    world.add_coupon(
+                        inviter,
+                        crate::state::CouponMem {
+                            code: format!("RWD_{inv}_{}", now.timestamp_millis()),
+                            discount: 1000,
+                            used_by: None,
+                            created_at: now,
+                        },
+                    );
+                }
             }
-            Err(e) => return Err(e),
         }
     }
-    if let Some(err) = last_err {
-        return Err(err);
-    }
-    state.world.write().unwrap().remember_user(
-        user_id.clone(),
+
+    let pool = state.pool.clone();
+    let req_sql = (
+        req.username.clone(),
         req.firstname.clone(),
         req.lastname.clone(),
-        access_token.clone(),
+        req.date_of_birth.clone(),
+        req.invitation_code.clone(),
     );
+    let uid = user_id.clone();
+    let tok = access_token.clone();
+    let inv_own = invitation_code.clone();
+    tokio::spawn(async move {
+        let _ = app_post_users_once(
+            &pool,
+            &crate::json::UserReg {
+                username: req_sql.0,
+                firstname: req_sql.1,
+                lastname: req_sql.2,
+                date_of_birth: req_sql.3,
+                invitation_code: req_sql.4,
+            },
+            &uid,
+            &tok,
+            &inv_own,
+        )
+        .await;
+    });
 
     let mut b = Buf::new();
     b.obj_open();
@@ -164,29 +226,21 @@ pub async fn app_post_payment_methods(
 ) -> Result<HttpResp, Error> {
     let user_id = require_user(state, token).await?;
     let pay = crate::json::parse_named_string(body, "token")?;
-    sqlx::query("INSERT INTO payment_tokens (user_id, token) VALUES (?, ?)")
-        .bind(&user_id)
-        .bind(&pay)
-        .execute(&state.pool)
-        .await?;
+    state
+        .world
+        .write()
+        .unwrap()
+        .payment_tokens
+        .insert(user_id.clone(), pay.clone());
+    let pool = state.pool.clone();
+    tokio::spawn(async move {
+        let _ = sqlx::query("INSERT INTO payment_tokens (user_id, token) VALUES (?, ?)")
+            .bind(&user_id)
+            .bind(&pay)
+            .execute(&pool)
+            .await;
+    });
     Ok(HttpResp::empty(204))
-}
-
-#[derive(Debug, sqlx::FromRow)]
-struct CompletedRideItem {
-    id: String,
-    pickup_latitude: i32,
-    pickup_longitude: i32,
-    destination_latitude: i32,
-    destination_longitude: i32,
-    evaluation: i32,
-    created_at: chrono::DateTime<chrono::Utc>,
-    updated_at: chrono::DateTime<chrono::Utc>,
-    chair_id: String,
-    chair_name: String,
-    chair_model: String,
-    owner_name: String,
-    discount: Option<i32>,
 }
 
 fn coord(b: &mut Buf, lat: i32, lng: i32) {
@@ -199,32 +253,52 @@ fn coord(b: &mut Buf, lat: i32, lng: i32) {
     b.obj_close();
 }
 
+struct RideHist {
+    id: String,
+    plat: i32,
+    plng: i32,
+    dlat: i32,
+    dlng: i32,
+    chair_id: String,
+    chair_name: String,
+    chair_model: String,
+    owner_name: String,
+    fare: i32,
+    evaluation: i32,
+    requested_at: i64,
+    completed_at: i64,
+}
+
 pub async fn app_get_rides(state: &AppState, token: Option<&str>) -> Result<HttpResp, Error> {
     let user_id = require_user(state, token).await?;
-    let rides: Vec<CompletedRideItem> = sqlx::query_as(
-        r#"SELECT r.id,
-                  r.pickup_latitude,
-                  r.pickup_longitude,
-                  r.destination_latitude,
-                  r.destination_longitude,
-                  r.evaluation,
-                  r.created_at,
-                  r.updated_at,
-                  c.id AS chair_id,
-                  c.name AS chair_name,
-                  c.model AS chair_model,
-                  o.name AS owner_name,
-                  cp.discount AS discount
-           FROM rides r
-           INNER JOIN chairs c ON c.id = r.chair_id
-           INNER JOIN owners o ON o.id = c.owner_id
-           LEFT JOIN coupons cp ON cp.used_by = r.id
-           WHERE r.user_id = ? AND r.latest_status = 'COMPLETED'
-           ORDER BY r.created_at DESC"#,
-    )
-    .bind(&user_id)
-    .fetch_all(&state.pool)
-    .await?;
+    let world = state.world.read().unwrap();
+    let mut rides: Vec<RideHist> = world
+        .rides
+        .values()
+        .filter(|r| r.user_id == user_id && r.status == "COMPLETED")
+        .filter_map(|r| {
+            let cid = r.chair_id.as_ref()?;
+            let chair = world.chairs.get(cid)?;
+            let owner = world.owners.get(&chair.owner_id);
+            Some(RideHist {
+                id: r.id.clone(),
+                plat: r.pickup_latitude,
+                plng: r.pickup_longitude,
+                dlat: r.destination_latitude,
+                dlng: r.destination_longitude,
+                chair_id: chair.id.clone(),
+                chair_name: chair.name.clone(),
+                chair_model: chair.model.clone(),
+                owner_name: owner.map(|o| o.name.clone()).unwrap_or_default(),
+                fare: r.fare,
+                evaluation: r.evaluation,
+                requested_at: r.created_at.timestamp_millis(),
+                completed_at: r.updated_at.timestamp_millis(),
+            })
+        })
+        .collect();
+    rides.sort_by_key(|r| std::cmp::Reverse(r.requested_at));
+    drop(world);
 
     let mut b = Buf::new();
     b.obj_open();
@@ -239,14 +313,10 @@ pub async fn app_get_rides(state: &AppState, token: Option<&str>) -> Result<Http
         b.str(&ride.id);
         b.comma();
         b.key("pickup_coordinate");
-        coord(&mut b, ride.pickup_latitude, ride.pickup_longitude);
+        coord(&mut b, ride.plat, ride.plng);
         b.comma();
         b.key("destination_coordinate");
-        coord(
-            &mut b,
-            ride.destination_latitude,
-            ride.destination_longitude,
-        );
+        coord(&mut b, ride.dlat, ride.dlng);
         b.comma();
         b.key("chair");
         b.obj_open();
@@ -264,22 +334,16 @@ pub async fn app_get_rides(state: &AppState, token: Option<&str>) -> Result<Http
         b.obj_close();
         b.comma();
         b.key("fare");
-        b.i32(discounted_fare(
-            ride.pickup_latitude,
-            ride.pickup_longitude,
-            ride.destination_latitude,
-            ride.destination_longitude,
-            ride.discount.unwrap_or(0),
-        ));
+        b.i32(ride.fare);
         b.comma();
         b.key("evaluation");
         b.i32(ride.evaluation);
         b.comma();
         b.key("requested_at");
-        b.i64(ride.created_at.timestamp_millis());
+        b.i64(ride.requested_at);
         b.comma();
         b.key("completed_at");
-        b.i64(ride.updated_at.timestamp_millis());
+        b.i64(ride.completed_at);
         b.obj_close();
     }
     b.arr_close();
@@ -294,39 +358,70 @@ pub async fn app_post_rides(
 ) -> Result<HttpResp, Error> {
     let user_id = require_user(state, token).await?;
     let (plat, plng, dlat, dlng) = crate::json::parse_two_coordinates(body)?;
-    let continuing = state
-        .world
-        .read()
-        .unwrap()
-        .rides
-        .values()
-        .any(|r| r.user_id == user_id && r.status != "COMPLETED");
-    if continuing {
-        return Err(Error::Conflict("ride already exists"));
-    }
-
-    let mut last_err: Option<Error> = None;
-    let mut ride_id = String::new();
-    let mut fare = 0;
-    for _ in 0..8 {
-        ride_id = Ulid::new().to_string();
-        match app_post_rides_once(state, &user_id, plat, plng, dlat, dlng, &ride_id).await {
-            Ok(f) => {
-                fare = f;
-                last_err = None;
-                break;
-            }
-            Err(Error::Sqlx(e)) if crate::is_deadlock(&e) => {
-                last_err = Some(Error::Sqlx(e));
-                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-                continue;
-            }
-            Err(e) => return Err(e),
+    let ride_id = Ulid::new().to_string();
+    let fare = {
+        let mut world = state.world.write().unwrap();
+        if world
+            .rides
+            .values()
+            .any(|r| r.user_id == user_id && r.status != "COMPLETED")
+        {
+            return Err(Error::Conflict("ride already exists"));
         }
-    }
-    if let Some(err) = last_err {
-        return Err(err);
-    }
+        let discount = world.consume_coupon(&user_id, &ride_id);
+        let fare = crate::discounted_fare(plat, plng, dlat, dlng, discount);
+        let now = chrono::Utc::now();
+        world.add_ride(crate::state::RideMem {
+            id: ride_id.clone(),
+            user_id: user_id.clone(),
+            chair_id: None,
+            pickup_latitude: plat,
+            pickup_longitude: plng,
+            destination_latitude: dlat,
+            destination_longitude: dlng,
+            status: "MATCHING".to_string(),
+            fare,
+            evaluation: 0,
+            discount,
+            created_at: now,
+            updated_at: now,
+        });
+        world.push_unmatched(crate::state::UnmatchedRide {
+            id: ride_id.clone(),
+            pickup_latitude: plat,
+            pickup_longitude: plng,
+            destination_latitude: dlat,
+            destination_longitude: dlng,
+            created_at: now,
+        });
+        fare
+    };
+    crate::spawn_matching(state.clone());
+    let pool = state.pool.clone();
+    let rid = ride_id.clone();
+    let uid = user_id.clone();
+    tokio::spawn(async move {
+        let _ = sqlx::query("INSERT INTO rides (id, user_id, pickup_latitude, pickup_longitude, destination_latitude, destination_longitude, latest_status) VALUES (?, ?, ?, ?, ?, ?, 'MATCHING')")
+            .bind(&rid)
+            .bind(&uid)
+            .bind(plat)
+            .bind(plng)
+            .bind(dlat)
+            .bind(dlng)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("INSERT INTO ride_statuses (id, ride_id, status) VALUES (?, ?, ?)")
+            .bind(Ulid::new().to_string())
+            .bind(&rid)
+            .bind("MATCHING")
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("UPDATE coupons SET used_by = ? WHERE user_id = ? AND used_by IS NULL ORDER BY created_at LIMIT 1")
+            .bind(&rid)
+            .bind(&uid)
+            .execute(&pool)
+            .await;
+    });
 
     let mut b = Buf::new();
     b.obj_open();
@@ -339,127 +434,6 @@ pub async fn app_post_rides(
     Ok(HttpResp::json(202, b.into_bytes()))
 }
 
-async fn app_post_rides_once(
-    state: &AppState,
-    user_id: &str,
-    plat: i32,
-    plng: i32,
-    dlat: i32,
-    dlng: i32,
-    ride_id: &str,
-) -> Result<i32, Error> {
-    let mut tx = state.pool.begin().await?;
-
-    sqlx::query("INSERT INTO rides (id, user_id, pickup_latitude, pickup_longitude, destination_latitude, destination_longitude, latest_status) VALUES (?, ?, ?, ?, ?, ?, 'MATCHING')")
-        .bind(ride_id)
-        .bind(user_id)
-        .bind(plat)
-        .bind(plng)
-        .bind(dlat)
-        .bind(dlng)
-        .execute(&mut *tx)
-        .await?;
-
-    sqlx::query("INSERT INTO ride_statuses (id, ride_id, status) VALUES (?, ?, ?)")
-        .bind(Ulid::new().to_string())
-        .bind(ride_id)
-        .bind("MATCHING")
-        .execute(&mut *tx)
-        .await?;
-
-    let ride_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rides WHERE user_id = ?")
-        .bind(user_id)
-        .fetch_one(&mut *tx)
-        .await?;
-
-    if ride_count == 1 {
-        let coupon: Option<Coupon> = sqlx::query_as("SELECT * FROM coupons WHERE user_id = ? AND code = 'CP_NEW2024' AND used_by IS NULL FOR UPDATE")
-            .bind(user_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-        if coupon.is_some() {
-            sqlx::query("UPDATE coupons SET used_by = ? WHERE user_id = ? AND code = 'CP_NEW2024'")
-                .bind(ride_id)
-                .bind(user_id)
-                .execute(&mut *tx)
-                .await?;
-        } else {
-            let coupon: Option<Coupon> = sqlx::query_as("SELECT * FROM coupons WHERE user_id = ? AND used_by IS NULL ORDER BY created_at LIMIT 1 FOR UPDATE")
-                .bind(user_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-            if let Some(coupon) = coupon {
-                sqlx::query("UPDATE coupons SET used_by = ? WHERE user_id = ? AND code = ?")
-                    .bind(ride_id)
-                    .bind(user_id)
-                    .bind(coupon.code)
-                    .execute(&mut *tx)
-                    .await?;
-            }
-        }
-    } else {
-        let coupon: Option<Coupon> = sqlx::query_as("SELECT * FROM coupons WHERE user_id = ? AND used_by IS NULL ORDER BY created_at LIMIT 1 FOR UPDATE")
-                .bind(user_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        if let Some(coupon) = coupon {
-            sqlx::query("UPDATE coupons SET used_by = ? WHERE user_id = ? AND code = ?")
-                .bind(ride_id)
-                .bind(user_id)
-                .bind(coupon.code)
-                .execute(&mut *tx)
-                .await?;
-        }
-    }
-
-    let ride: Ride = sqlx::query_as("SELECT * FROM rides WHERE id = ?")
-        .bind(ride_id)
-        .fetch_one(&mut *tx)
-        .await?;
-
-    let fare = calculate_discounted_fare(
-        &mut tx,
-        user_id,
-        Some(&ride),
-        plat,
-        plng,
-        dlat,
-        dlng,
-    )
-    .await?;
-
-    tx.commit().await?;
-
-    {
-        let mut world = state.world.write().unwrap();
-        let now = chrono::Utc::now();
-        world.add_ride(crate::state::RideMem {
-            id: ride_id.to_string(),
-            user_id: user_id.to_string(),
-            chair_id: None,
-            pickup_latitude: plat,
-            pickup_longitude: plng,
-            destination_latitude: dlat,
-            destination_longitude: dlng,
-            status: "MATCHING".to_string(),
-            fare,
-            created_at: now,
-            updated_at: now,
-        });
-        world.push_unmatched(crate::state::UnmatchedRide {
-            id: ride_id.to_string(),
-            pickup_latitude: plat,
-            pickup_longitude: plng,
-            destination_latitude: dlat,
-            destination_longitude: dlng,
-            created_at: now,
-        });
-    }
-
-    crate::spawn_matching(state.clone());
-    Ok(fare)
-}
-
 pub async fn app_post_estimated_fare(
     state: &AppState,
     token: Option<&str>,
@@ -467,11 +441,8 @@ pub async fn app_post_estimated_fare(
 ) -> Result<HttpResp, Error> {
     let user_id = require_user(state, token).await?;
     let (plat, plng, dlat, dlng) = crate::json::parse_two_coordinates(body)?;
-    let mut tx = state.pool.begin().await?;
-    let discounted =
-        calculate_discounted_fare(&mut tx, &user_id, None, plat, plng, dlat, dlng).await?;
-    tx.commit().await?;
-
+    let discount = state.world.read().unwrap().peek_discount(&user_id);
+    let discounted = crate::discounted_fare(plat, plng, dlat, dlng, discount);
     let mut b = Buf::new();
     b.obj_open();
     b.key("fare");
@@ -495,135 +466,85 @@ pub async fn app_post_ride_evaluation(
         return Err(Error::BadRequest("evaluation must be between 1 and 5"));
     }
 
-    let mut tx = state.pool.begin().await?;
-
-    let Some(mut ride): Option<Ride> = sqlx::query_as("SELECT * FROM rides WHERE id = ?")
-        .bind(ride_id)
-        .fetch_optional(&mut *tx)
-        .await?
-    else {
-        return Err(Error::NotFound("ride not found"));
-    };
-
-    let mem_chair = state
-        .world
-        .read()
-        .unwrap()
-        .rides
-        .get(ride_id)
-        .and_then(|r| r.chair_id.clone());
-    if ride.chair_id.is_none() {
-        if let Some(cid) = mem_chair.clone() {
-            sqlx::query("UPDATE rides SET chair_id = ?, updated_at = updated_at WHERE id = ?")
-                .bind(&cid)
-                .bind(ride_id)
-                .execute(&mut *tx)
-                .await?;
-            ride.chair_id = Some(cid);
-        }
-    }
-
-    let arrived = state
-        .world
-        .read()
-        .unwrap()
-        .rides
-        .get(ride_id)
-        .map(|r| r.status == "ARRIVED")
-        .unwrap_or(false)
-        || ride.latest_status == "ARRIVED";
-    if !arrived {
-        return Err(Error::BadRequest("not arrived yet"));
-    }
-
-    let result = sqlx::query("UPDATE rides SET evaluation = ? WHERE id = ?")
-        .bind(evaluation)
-        .bind(ride_id)
-        .execute(&mut *tx)
-        .await?;
-    if result.rows_affected() == 0 {
-        return Err(Error::NotFound("ride not found"));
-    }
-
-    insert_ride_status(&mut tx, ride_id, "COMPLETED").await?;
-
-    if let Some(chair_id) = ride.chair_id.as_ref() {
-        sqlx::query(
-            "UPDATE chairs SET total_rides_count = total_rides_count + 1, total_evaluation_sum = total_evaluation_sum + ? WHERE id = ?",
-        )
-        .bind(evaluation)
-        .bind(chair_id)
-        .execute(&mut *tx)
-        .await?;
-    }
-
-    let Some(ride): Option<Ride> = sqlx::query_as("SELECT * FROM rides WHERE id = ?")
-        .bind(ride_id)
-        .fetch_optional(&mut *tx)
-        .await?
-    else {
-        return Err(Error::NotFound("ride not found"));
-    };
-
-    let Some(payment_token): Option<PaymentToken> =
-        sqlx::query_as("SELECT * FROM payment_tokens WHERE user_id = ?")
-            .bind(&ride.user_id)
-            .fetch_optional(&mut *tx)
-            .await?
-    else {
-        return Err(Error::BadRequest("payment token not registered"));
-    };
-
-    let fare = calculate_discounted_fare(
-        &mut tx,
-        &ride.user_id,
-        Some(&ride),
-        ride.pickup_latitude,
-        ride.pickup_longitude,
-        ride.destination_latitude,
-        ride.destination_longitude,
-    )
-    .await?;
-
-    let payment_gateway_url: String =
-        sqlx::query_scalar("SELECT value FROM settings WHERE name = 'payment_gateway_url'")
-            .fetch_one(&mut *tx)
-            .await?;
-
-    async fn retrieve_rides_order_by_created_at_asc(
-        tx: &mut sqlx::MySqlConnection,
-        user_id: &str,
-    ) -> Result<Vec<Ride>, Error> {
-        sqlx::query_as("SELECT * FROM rides WHERE user_id = ? ORDER BY created_at ASC")
-            .bind(user_id)
-            .fetch_all(tx)
-            .await
-            .map_err(Error::Sqlx)
-    }
-
-    crate::payment_gateway::request_payment_gateway_post_payment(
-        &payment_gateway_url,
-        &payment_token.token,
-        &crate::payment_gateway::PaymentGatewayPostPaymentRequest { amount: fare },
-        &ride.id,
-        &mut tx,
-        &ride.user_id,
-        retrieve_rides_order_by_created_at_asc,
-    )
-    .await?;
-
-    tx.commit().await?;
-
-    {
-        let mut world = state.world.write().unwrap();
-        let mem_chair = world
+    let (arrived, fare, pay_token, pay_url, user_id, chair_id, ride_count) = {
+        let world = state.world.read().unwrap();
+        let ride = world
             .rides
             .get(ride_id)
-            .and_then(|r| r.chair_id.clone());
-        let chair_id = mem_chair.or(ride.chair_id.clone());
-        world.complete_ride(ride_id, chair_id.as_deref(), evaluation, ride.updated_at);
+            .ok_or(Error::NotFound("ride not found"))?;
+        if ride.status != "ARRIVED" {
+            return Err(Error::BadRequest("not arrived yet"));
+        }
+        let token = world
+            .payment_tokens
+            .get(&ride.user_id)
+            .cloned()
+            .ok_or(Error::BadRequest("payment token not registered"))?;
+        let url = world.payment_gateway_url.clone();
+        if url.is_empty() {
+            return Err(Error::BadRequest("payment token not registered"));
+        }
+        let n = world
+            .rides
+            .values()
+            .filter(|r| r.user_id == ride.user_id)
+            .count();
+        (
+            true,
+            ride.fare,
+            token,
+            url,
+            ride.user_id.clone(),
+            ride.chair_id.clone(),
+            n,
+        )
+    };
+    let _ = arrived;
+
+    crate::payment_gateway::request_payment_gateway_post_payment(
+        &pay_url,
+        &pay_token,
+        fare,
+        ride_id,
+        ride_count,
+    )
+    .await?;
+
+    let completed_at = chrono::Utc::now();
+    {
+        let mut world = state.world.write().unwrap();
+        world.complete_ride(ride_id, chair_id.as_deref(), evaluation, completed_at);
     }
     crate::spawn_matching(state.clone());
+
+    let pool = state.pool.clone();
+    let rid = ride_id.to_string();
+    let cid = chair_id.clone();
+    tokio::spawn(async move {
+        let _ = sqlx::query(
+            "UPDATE rides SET evaluation = ?, latest_status = 'COMPLETED', chair_id = COALESCE(?, chair_id), updated_at = updated_at WHERE id = ?",
+        )
+        .bind(evaluation)
+        .bind(&cid)
+        .bind(&rid)
+        .execute(&pool)
+        .await;
+        let _ = sqlx::query("INSERT INTO ride_statuses (id, ride_id, status) VALUES (?, ?, 'COMPLETED')")
+            .bind(ulid::Ulid::new().to_string())
+            .bind(&rid)
+            .execute(&pool)
+            .await;
+        if let Some(chair_id) = cid {
+            let _ = sqlx::query(
+                "UPDATE chairs SET total_rides_count = total_rides_count + 1, total_evaluation_sum = total_evaluation_sum + ? WHERE id = ?",
+            )
+            .bind(evaluation)
+            .bind(&chair_id)
+            .execute(&pool)
+            .await;
+        }
+        let _ = user_id;
+    });
 
     let mut b = Buf::new();
     b.obj_open();
@@ -631,7 +552,7 @@ pub async fn app_post_ride_evaluation(
     b.i32(fare);
     b.comma();
     b.key("completed_at");
-    b.i64(ride.updated_at.timestamp_millis());
+    b.i64(completed_at.timestamp_millis());
     b.obj_close();
     Ok(HttpResp::json(200, b.into_bytes()))
 }
@@ -784,51 +705,4 @@ pub async fn app_get_nearby_chairs(
     b.i64(retrieved_at.timestamp_millis());
     b.obj_close();
     Ok(HttpResp::json(200, b.into_bytes()))
-}
-
-async fn calculate_discounted_fare(
-    tx: &mut sqlx::MySqlConnection,
-    user_id: &str,
-    ride: Option<&Ride>,
-    mut pickup_latitude: i32,
-    mut pickup_longitude: i32,
-    mut dest_latitude: i32,
-    mut dest_longitude: i32,
-) -> sqlx::Result<i32> {
-    let discount = if let Some(ride) = ride {
-        dest_latitude = ride.destination_latitude;
-        dest_longitude = ride.destination_longitude;
-        pickup_latitude = ride.pickup_latitude;
-        pickup_longitude = ride.pickup_longitude;
-
-        let coupon: Option<Coupon> = sqlx::query_as("SELECT * FROM coupons WHERE used_by = ?")
-            .bind(&ride.id)
-            .fetch_optional(&mut *tx)
-            .await?;
-        coupon.map(|c| c.discount).unwrap_or(0)
-    } else {
-        let coupon: Option<Coupon> = sqlx::query_as(
-            "SELECT * FROM coupons WHERE user_id = ? AND code = 'CP_NEW2024' AND used_by IS NULL",
-        )
-        .bind(user_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if let Some(coupon) = coupon {
-            coupon.discount
-        } else {
-            let coupon: Option<Coupon> = sqlx::query_as("SELECT * FROM coupons WHERE user_id = ? AND used_by IS NULL ORDER BY created_at LIMIT 1")
-                .bind(user_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-            coupon.map(|c| c.discount).unwrap_or(0)
-        }
-    };
-
-    Ok(discounted_fare(
-        pickup_latitude,
-        pickup_longitude,
-        dest_latitude,
-        dest_longitude,
-        discount,
-    ))
 }

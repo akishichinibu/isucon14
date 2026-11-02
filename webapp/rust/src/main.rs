@@ -1,11 +1,14 @@
 use isuride::AppState;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -53,11 +56,17 @@ async fn main() -> anyhow::Result<()> {
             isuride::state::World::default()
         });
 
+    let public_dir = std::env::var("ISUCON_PUBLIC_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("../public"));
+    let static_files = Arc::new(isuride::http::load_static_files(&public_dir));
+
     let app_state = AppState {
         pool,
         matching_lock: Arc::new(tokio::sync::Mutex::new(())),
         world: std::sync::Arc::new(std::sync::RwLock::new(world)),
         matching_enabled,
+        static_files,
     };
 
     if matching_enabled {
@@ -74,12 +83,30 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let tcp_listener =
-        if let Some(std_listener) = listenfd::ListenFd::from_env().take_tcp_listener(0)? {
-            TcpListener::from_std(std_listener)?
-        } else {
-            TcpListener::bind(&SocketAddr::from(([0, 0, 0, 0], 8080))).await?
-        };
-    isuride::http::serve(tcp_listener, app_state).await?;
+    let plain = TcpListener::bind(&SocketAddr::from(([0, 0, 0, 0], 8080))).await?;
+    let state_plain = app_state.clone();
+    tokio::spawn(async move {
+        if let Err(err) = isuride::http::serve(plain, state_plain).await {
+            tracing::error!("plain 8080: {err}");
+        }
+    });
+
+    let cert = std::env::var("ISUCON_TLS_CERT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/etc/nginx/tls/_.xiv.isucon.net.crt"));
+    let key = std::env::var("ISUCON_TLS_KEY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/etc/nginx/tls/_.xiv.isucon.net.key"));
+    match isuride::http::load_tls_acceptor(&cert, &key) {
+        Ok(acceptor) => {
+            let tls = TcpListener::bind(&SocketAddr::from(([0, 0, 0, 0], 443))).await?;
+            tracing::warn!("tls 443 ready");
+            isuride::http::serve_tls(tls, acceptor, app_state).await?;
+        }
+        Err(err) => {
+            tracing::warn!("tls disabled: {err}");
+            std::future::pending::<()>().await;
+        }
+    }
     Ok(())
 }

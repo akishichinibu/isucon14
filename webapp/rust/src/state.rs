@@ -80,6 +80,8 @@ pub struct RideMem {
     pub destination_longitude: i32,
     pub status: String,
     pub fare: i32,
+    pub evaluation: i32,
+    pub discount: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -94,6 +96,14 @@ pub struct StatusEvent {
 pub struct UserMem {
     pub firstname: String,
     pub lastname: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CouponMem {
+    pub code: String,
+    pub discount: i32,
+    pub used_by: Option<String>,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
@@ -116,12 +126,90 @@ pub struct World {
     pub chair_by_token: HashMap<String, String>,
     pub owner_by_token: HashMap<String, String>,
     pub owner_by_register: HashMap<String, String>,
+    pub coupons: HashMap<String, Vec<CouponMem>>,
+    pub payment_tokens: HashMap<String, String>,
+    pub payment_gateway_url: String,
+    pub model_speed: HashMap<String, i32>,
+    pub invitation_by_code: HashMap<String, String>,
 }
 
 impl World {
-    pub fn remember_user(&mut self, id: String, firstname: String, lastname: String, token: String) {
+    pub fn remember_user(
+        &mut self,
+        id: String,
+        firstname: String,
+        lastname: String,
+        token: String,
+        invitation_code: String,
+    ) {
+        if !invitation_code.is_empty() {
+            self.invitation_by_code
+                .insert(invitation_code, id.clone());
+        }
         self.user_by_token.insert(token, id.clone());
         self.users.insert(id, UserMem { firstname, lastname });
+    }
+
+    pub fn peek_discount(&self, user_id: &str) -> i32 {
+        let Some(cs) = self.coupons.get(user_id) else {
+            return 0;
+        };
+        let ride_count = self
+            .rides
+            .values()
+            .filter(|r| r.user_id == user_id)
+            .count();
+        if ride_count == 0 {
+            if let Some(c) = cs
+                .iter()
+                .find(|c| c.code == "CP_NEW2024" && c.used_by.is_none())
+            {
+                return c.discount;
+            }
+        }
+        cs.iter()
+            .filter(|c| c.used_by.is_none())
+            .min_by_key(|c| c.created_at)
+            .map(|c| c.discount)
+            .unwrap_or(0)
+    }
+
+    pub fn consume_coupon(&mut self, user_id: &str, ride_id: &str) -> i32 {
+        let ride_count = self
+            .rides
+            .values()
+            .filter(|r| r.user_id == user_id)
+            .count();
+        let Some(cs) = self.coupons.get_mut(user_id) else {
+            return 0;
+        };
+        let idx = if ride_count == 0 {
+            cs.iter()
+                .position(|c| c.code == "CP_NEW2024" && c.used_by.is_none())
+                .or_else(|| {
+                    cs.iter()
+                        .enumerate()
+                        .filter(|(_, c)| c.used_by.is_none())
+                        .min_by_key(|(_, c)| c.created_at)
+                        .map(|(i, _)| i)
+                })
+        } else {
+            cs.iter()
+                .enumerate()
+                .filter(|(_, c)| c.used_by.is_none())
+                .min_by_key(|(_, c)| c.created_at)
+                .map(|(i, _)| i)
+        };
+        if let Some(i) = idx {
+            cs[i].used_by = Some(ride_id.to_string());
+            cs[i].discount
+        } else {
+            0
+        }
+    }
+
+    pub fn add_coupon(&mut self, user_id: String, coupon: CouponMem) {
+        self.coupons.entry(user_id).or_default().push(coupon);
     }
 
     pub fn upsert_chair(&mut self, chair: ChairMem, access_token: String) {
@@ -305,6 +393,7 @@ impl World {
         if let Some(ride) = self.rides.get_mut(ride_id) {
             ride.updated_at = completed_at;
             ride.status = "COMPLETED".to_string();
+            ride.evaluation = evaluation;
         }
         if let Some(cid) = chair_id {
             if let Some(c) = self.chairs.get_mut(&cid) {
@@ -475,8 +564,10 @@ impl World {
         });
         let pending: Vec<UnmatchedRide> = self.unmatched.iter().cloned().collect();
 
+        const NEAR: i32 = 400;
         for ride in pending {
-            let mut best: Option<(String, i32, i32)> = None;
+            let mut best_near: Option<(String, i32, i32)> = None;
+            let mut best_far: Option<(String, i32, i32)> = None;
             for chair in self.chairs.values() {
                 if used_chairs.contains(&chair.id)
                     || !chair.is_active
@@ -492,7 +583,7 @@ impl World {
                     }
                     _ => 50_000,
                 };
-                let better = match &best {
+                let better = |best: &Option<(String, i32, i32)>| match best {
                     None => true,
                     Some((_, bd, bs)) => {
                         let eta = dist as f64 / chair.speed as f64;
@@ -500,11 +591,14 @@ impl World {
                         eta < best_eta || (eta == best_eta && dist < *bd)
                     }
                 };
-                if better {
-                    best = Some((chair.id.clone(), dist, chair.speed));
+                if dist <= NEAR && better(&best_near) {
+                    best_near = Some((chair.id.clone(), dist, chair.speed));
+                }
+                if better(&best_far) {
+                    best_far = Some((chair.id.clone(), dist, chair.speed));
                 }
             }
-            if let Some((chair_id, _, _)) = best {
+            if let Some((chair_id, _, _)) = best_near.or(best_far) {
                 used_chairs.insert(chair_id.clone());
                 let hint = ChairRideHint {
                     ride_id: ride.id.clone(),
@@ -555,6 +649,7 @@ struct RideRow {
     destination_latitude: i32,
     destination_longitude: i32,
     latest_status: String,
+    evaluation: Option<i32>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -565,6 +660,7 @@ struct UserRow {
     firstname: String,
     lastname: String,
     access_token: String,
+    invitation_code: String,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -591,14 +687,14 @@ pub async fn load_world(pool: &sqlx::MySqlPool) -> sqlx::Result<World> {
 
     let rides: Vec<RideRow> = sqlx::query_as(
         r#"SELECT id, user_id, chair_id, pickup_latitude, pickup_longitude,
-                  destination_latitude, destination_longitude, latest_status, created_at, updated_at
+                  destination_latitude, destination_longitude, latest_status, evaluation, created_at, updated_at
            FROM rides"#,
     )
     .fetch_all(pool)
     .await?;
 
     let users: Vec<UserRow> =
-        sqlx::query_as("SELECT id, firstname, lastname, access_token FROM users")
+        sqlx::query_as("SELECT id, firstname, lastname, access_token, invitation_code FROM users")
             .fetch_all(pool)
             .await?;
     let owners: Vec<OwnerRow> = sqlx::query_as(
@@ -608,8 +704,51 @@ pub async fn load_world(pool: &sqlx::MySqlPool) -> sqlx::Result<World> {
     .await?;
 
     let mut world = World::default();
+    let models: Vec<(String, i32)> = sqlx::query_as("SELECT name, speed FROM chair_models")
+        .fetch_all(pool)
+        .await?;
+    for (name, speed) in models {
+        world.model_speed.insert(name, speed.max(1));
+    }
+    if let Ok(url) = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM settings WHERE name = 'payment_gateway_url'",
+    )
+    .fetch_one(pool)
+    .await
+    {
+        world.payment_gateway_url = url;
+    }
+    let tokens: Vec<(String, String)> =
+        sqlx::query_as("SELECT user_id, token FROM payment_tokens")
+            .fetch_all(pool)
+            .await?;
+    for (uid, tok) in tokens {
+        world.payment_tokens.insert(uid, tok);
+    }
+    let coupon_rows: Vec<(String, String, i32, Option<String>, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT user_id, code, discount, used_by, created_at FROM coupons",
+    )
+    .fetch_all(pool)
+    .await?;
+    for (uid, code, discount, used_by, created_at) in coupon_rows {
+        world.add_coupon(
+            uid,
+            CouponMem {
+                code,
+                discount,
+                used_by,
+                created_at,
+            },
+        );
+    }
     for u in users {
-        world.remember_user(u.id, u.firstname, u.lastname, u.access_token);
+        world.remember_user(
+            u.id,
+            u.firstname,
+            u.lastname,
+            u.access_token,
+            u.invitation_code,
+        );
     }
     for o in owners {
         world.remember_owner(o.id, o.name, o.access_token, o.chair_register_token);
@@ -648,12 +787,24 @@ pub async fn load_world(pool: &sqlx::MySqlPool) -> sqlx::Result<World> {
             destination_latitude: ride.destination_latitude,
             destination_longitude: ride.destination_longitude,
             status: ride.latest_status.clone(),
-            fare: crate::calculate_fare(
-                ride.pickup_latitude,
-                ride.pickup_longitude,
-                ride.destination_latitude,
-                ride.destination_longitude,
-            ),
+            fare: {
+                let discount = world
+                    .coupons
+                    .values()
+                    .flatten()
+                    .find(|c| c.used_by.as_deref() == Some(ride.id.as_str()))
+                    .map(|c| c.discount)
+                    .unwrap_or(0);
+                crate::discounted_fare(
+                    ride.pickup_latitude,
+                    ride.pickup_longitude,
+                    ride.destination_latitude,
+                    ride.destination_longitude,
+                    discount,
+                )
+            },
+            evaluation: ride.evaluation.unwrap_or(0),
+            discount: 0,
             created_at: ride.created_at,
             updated_at: ride.updated_at,
         };

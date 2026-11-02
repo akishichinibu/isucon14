@@ -2,8 +2,12 @@
 
 use std::io::Write as _;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 use crate::json::error_body;
 use crate::{AppState, Error};
@@ -37,12 +41,14 @@ pub enum Route {
     GetChairNotification,
     PostChairRideStatus { ride_id: String },
     GetInternalMatching,
+    Static { path: String },
 }
 
 pub struct HttpResp {
     pub status: u16,
     pub body: Vec<u8>,
     pub set_cookie: Option<(&'static str, String)>,
+    pub content_type: Option<String>,
 }
 
 impl HttpResp {
@@ -51,6 +57,7 @@ impl HttpResp {
             status,
             body,
             set_cookie: None,
+            content_type: Some("application/json".to_string()),
         }
     }
     pub fn empty(status: u16) -> Self {
@@ -58,6 +65,15 @@ impl HttpResp {
             status,
             body: Vec::new(),
             set_cookie: None,
+            content_type: None,
+        }
+    }
+    pub fn bytes(status: u16, content_type: String, body: Vec<u8>) -> Self {
+        Self {
+            status,
+            body,
+            set_cookie: None,
+            content_type: Some(content_type),
         }
     }
     pub fn cookie(mut self, name: &'static str, value: String) -> Self {
@@ -149,6 +165,9 @@ fn match_route(method: Method, path: &[u8]) -> Option<Route> {
                 ride_id: String::from_utf8_lossy(&p[start..end]).into_owned(),
             })
         }
+        (Method::Get, p) if !p.starts_with(b"/api/") => Some(Route::Static {
+            path: String::from_utf8_lossy(p).into_owned(),
+        }),
         _ => None,
     }
 }
@@ -249,7 +268,11 @@ fn status_text(code: u16) -> &'static str {
     }
 }
 
-async fn write_resp(stream: &mut TcpStream, resp: HttpResp, keepalive: bool) -> std::io::Result<()> {
+async fn write_resp<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    resp: HttpResp,
+    keepalive: bool,
+) -> std::io::Result<()> {
     let mut head = Vec::with_capacity(256 + resp.body.len());
     let _ = write!(
         &mut head,
@@ -257,12 +280,10 @@ async fn write_resp(stream: &mut TcpStream, resp: HttpResp, keepalive: bool) -> 
         resp.status,
         status_text(resp.status)
     );
-    if resp.status != 204 {
-        head.extend_from_slice(b"Content-Type: application/json\r\n");
-        let _ = write!(&mut head, "Content-Length: {}\r\n", resp.body.len());
-    } else {
-        head.extend_from_slice(b"Content-Length: 0\r\n");
+    if let Some(ct) = resp.content_type {
+        let _ = write!(&mut head, "Content-Type: {ct}\r\n");
     }
+    let _ = write!(&mut head, "Content-Length: {}\r\n", resp.body.len());
     if let Some((name, value)) = resp.set_cookie {
         let _ = write!(&mut head, "Set-Cookie: {name}={value}; Path=/\r\n");
     }
@@ -339,6 +360,7 @@ async fn dispatch(state: AppState, req: Parsed) -> HttpResp {
             .await
         }
         Route::GetInternalMatching => crate::internal_handlers::internal_get_matching(&state).await,
+        Route::Static { path } => Ok(serve_static(&state, &path)),
     };
     match out {
         Ok(r) => r,
@@ -346,8 +368,69 @@ async fn dispatch(state: AppState, req: Parsed) -> HttpResp {
     }
 }
 
-async fn handle_conn(mut stream: TcpStream, state: AppState) {
-    let _ = stream.set_nodelay(true);
+fn content_type_for(path: &str) -> &'static str {
+    match Path::new(path).extension().and_then(|s| s.to_str()) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "application/javascript",
+        Some("css") => "text/css",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("ico") => "image/x-icon",
+        Some("json") => "application/json",
+        Some("woff2") => "font/woff2",
+        _ => "application/octet-stream",
+    }
+}
+
+pub fn load_static_files(root: &Path) -> std::collections::HashMap<String, (String, Vec<u8>)> {
+    let mut out = std::collections::HashMap::new();
+    fn walk(
+        dir: &Path,
+        root: &Path,
+        out: &mut std::collections::HashMap<String, (String, Vec<u8>)>,
+    ) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for ent in rd.flatten() {
+            let path = ent.path();
+            if path.is_dir() {
+                walk(&path, root, out);
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let rel = path.strip_prefix(root).unwrap_or(&path);
+            let url = format!("/{}", rel.to_string_lossy().replace('\\', "/"));
+            let ct = content_type_for(&url).to_string();
+            out.insert(url, (ct, bytes));
+        }
+    }
+    walk(root, root, &mut out);
+    if let Some(index) = out.get("/index.html").cloned() {
+        out.entry("/".to_string()).or_insert_with(|| index.clone());
+        out.entry("/client".to_string())
+            .or_insert_with(|| index.clone());
+        out.entry("/owner".to_string()).or_insert(index);
+    }
+    out
+}
+
+fn serve_static(state: &AppState, path: &str) -> HttpResp {
+    if path.contains("..") {
+        return HttpResp::from(Error::NotFound("not found"));
+    }
+    if let Some((ct, body)) = state.static_files.get(path) {
+        return HttpResp::bytes(200, ct.clone(), body.clone());
+    }
+    if let Some((ct, body)) = state.static_files.get("/index.html") {
+        return HttpResp::bytes(200, ct.clone(), body.clone());
+    }
+    HttpResp::from(Error::NotFound("not found"))
+}
+
+async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, state: AppState) {
     let mut buf = vec![0u8; 8192];
     let mut filled = 0usize;
     loop {
@@ -361,25 +444,26 @@ async fn handle_conn(mut stream: TcpStream, state: AppState) {
             if filled == buf.len() {
                 buf.resize((buf.len() * 2).min(MAX_HEADER + MAX_BODY), 0);
             }
-            match stream.read(&mut buf[filled..]).await {
-                Ok(0) => return,
-                Ok(n) => filled += n,
-                Err(_) => return,
+            match tokio::time::timeout(Duration::from_secs(65), stream.read(&mut buf[filled..]))
+                .await
+            {
+                Ok(Ok(0)) | Err(_) => return,
+                Ok(Ok(n)) => filled += n,
+                Ok(Err(_)) => return,
             }
         };
         let parsed_headers = match parse_headers(&buf[..header_end]) {
             Ok(h) => h,
             Err(e) => {
-                let keepalive = false;
-                let _ = write_resp(&mut stream, HttpResp::from(e), keepalive).await;
+                let _ = write_resp(&mut stream, HttpResp::from(e), false).await;
                 return;
             }
         };
         let (
-            _method,
+            method,
             route,
             query,
-            _keepalive,
+            keepalive,
             app_session,
             owner_session,
             chair_session,
@@ -408,31 +492,80 @@ async fn handle_conn(mut stream: TcpStream, state: AppState) {
         filled = leftover;
 
         let req = Parsed {
-            method: _method,
+            method,
             route,
             query,
-            keepalive: false,
+            keepalive,
             app_session,
             owner_session,
             chair_session,
             body,
         };
         let resp = dispatch(state.clone(), req).await;
-        // Close after each response so nginx workers are not pinned to idle
-        // keepalive sockets while the bench opens thousands of polls.
-        if write_resp(&mut stream, resp, false).await.is_err() {
+        if write_resp(&mut stream, resp, keepalive).await.is_err() {
             return;
         }
-        return;
+        if !keepalive {
+            return;
+        }
     }
+}
+
+pub fn load_tls_acceptor(cert_path: &Path, key_path: &Path) -> anyhow::Result<tokio_rustls::TlsAcceptor> {
+    let cert_pem = std::fs::read(cert_path)?;
+    let key_pem = std::fs::read(key_path)?;
+    let mut cert_reader = std::io::Cursor::new(cert_pem);
+    let mut key_reader = std::io::Cursor::new(key_pem);
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+    let key = rustls_pemfile::private_key(&mut key_reader)?
+        .ok_or_else(|| anyhow::anyhow!("no private key"))?;
+    let cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(cfg)))
 }
 
 pub async fn serve(listener: TcpListener, state: AppState) -> std::io::Result<()> {
     loop {
-        let (stream, _) = listener.accept().await?;
-        let state = state.clone();
-        tokio::spawn(async move {
-            handle_conn(stream, state).await;
-        });
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                let _ = stream.set_nodelay(true);
+                let state = state.clone();
+                tokio::spawn(async move {
+                    handle_conn(stream, state).await;
+                });
+            }
+            Err(err) => {
+                tracing::error!("accept: {err}");
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+    }
+}
+
+pub async fn serve_tls(
+    listener: TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+    state: AppState,
+) -> std::io::Result<()> {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                let _ = stream.set_nodelay(true);
+                let state = state.clone();
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    handle_conn(tls, state).await;
+                });
+            }
+            Err(err) => {
+                tracing::error!("tls accept: {err}");
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
     }
 }
