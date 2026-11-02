@@ -20,6 +20,7 @@ HTTPS `https://isuride.xiv.isucon.net` → `.210`. Language: Go.
 |------|--------|-------|
 | `main` initial Go reference | pass | 2042 |
 | `feat/go-opt` indexes + matching + JSON notify | pass | **32498** (four CODE=26 warnings) |
+| `feat/rust` in-memory match/coords, MySQL .212, nginx LB | pass | **60030** |
 
 ```bash
 bash scripts/deploy.sh
