@@ -117,6 +117,7 @@ impl World {
         self.chairs
             .values()
             .filter(|c| {
+                // Same rule as the reference SQL: active, has a position, not on an open ride.
                 c.is_active
                     && c.current_ride.is_none()
                     && c.latitude.is_some()

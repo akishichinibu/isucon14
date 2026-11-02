@@ -110,7 +110,7 @@ pub fn spawn_matching(state: AppState) {
 pub fn is_deadlock(err: &sqlx::Error) -> bool {
     err.as_database_error()
         .and_then(|d| d.code())
-        .map(|c| c == "1213")
+        .map(|c| c == "1213" || c == "40001")
         .unwrap_or(false)
 }
 

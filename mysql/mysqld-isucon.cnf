@@ -2,7 +2,8 @@
 bind-address = 0.0.0.0
 mysqlx-bind-address = 0.0.0.0
 
-innodb_buffer_pool_size = 2G
+# Winner (takonomura) used 1G on a dedicated 4GiB MySQL box.
+innodb_buffer_pool_size = 1G
 innodb_buffer_pool_instances = 1
 innodb_flush_log_at_trx_commit = 2
 innodb_flush_method = O_DIRECT

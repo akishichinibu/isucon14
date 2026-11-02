@@ -77,6 +77,7 @@ async fn app_post_users(
             }
             Err(Error::Sqlx(e)) if crate::is_deadlock(&e) => {
                 last_err = Some(Error::Sqlx(e));
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
                 continue;
             }
             Err(e) => return Err(e),
