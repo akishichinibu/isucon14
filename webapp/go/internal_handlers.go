@@ -11,11 +11,7 @@ import (
 	"github.com/jmoiron/sqlx"
 )
 
-const (
-	// Cross-city assignments waste a chair for a long time. Official writeup uses 400.
-	maxMatchDistance = 400
-	matchingTick     = 50 * time.Millisecond
-)
+const matchingTick = 50 * time.Millisecond
 
 var matchingMu sync.Mutex
 
@@ -137,9 +133,6 @@ WHERE c.is_active = TRUE
 				continue
 			}
 			dist := calculateDistance(lats[ci], lons[ci], rides[ri].PickupLatitude, rides[ri].PickupLongitude)
-			if dist > maxMatchDistance {
-				continue
-			}
 			speed := chairs[ci].Speed
 			if speed <= 0 {
 				speed = 1
