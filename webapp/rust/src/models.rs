@@ -52,6 +52,7 @@ pub struct Ride {
     pub evaluation: Option<i32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub latest_status: String,
 }
 
 #[derive(Debug, sqlx::FromRow)]

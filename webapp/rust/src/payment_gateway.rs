@@ -1,6 +1,8 @@
 use crate::models::Ride;
 use crate::Error;
 use std::future::Future;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PaymentGatewayError {
@@ -22,8 +24,20 @@ pub struct PaymentGatewayPostPaymentRequest {
 
 #[derive(Debug, serde::Deserialize)]
 struct PaymentGatewayGetPaymentsResponseOne {
+    #[allow(dead_code)]
     amount: i32,
+    #[allow(dead_code)]
     status: String,
+}
+
+fn http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("reqwest client")
+    })
 }
 
 pub trait PostPaymentCallback<'a> {
@@ -46,6 +60,7 @@ pub async fn request_payment_gateway_post_payment<F>(
     payment_gateway_url: &str,
     token: &str,
     param: &PaymentGatewayPostPaymentRequest,
+    idempotency_key: &str,
     tx: &mut sqlx::MySqlConnection,
     user_id: &str,
     retrieve_rides_order_by_created_at_asc: F,
@@ -53,30 +68,32 @@ pub async fn request_payment_gateway_post_payment<F>(
 where
     F: for<'a> PostPaymentCallback<'a>,
 {
-    // 失敗したらとりあえずリトライ
-    // FIXME: 社内決済マイクロサービスのインフラに異常が発生していて、同時にたくさんリクエストすると変なことになる可能性あり
+    // Retry on failure. Idempotency-Key prevents duplicate charges if the
+    // upstream payment service supports it (documented for the contest gateway).
     let mut retry = 0;
+    let client = http_client();
 
     loop {
         let result = async {
-            let res = reqwest::Client::new()
+            let res = client
                 .post(format!("{payment_gateway_url}/payments"))
                 .bearer_auth(token)
+                .header("Idempotency-Key", idempotency_key)
                 .json(param)
                 .send()
                 .await
                 .map_err(PaymentGatewayError::Reqwest)?;
 
             if res.status() != reqwest::StatusCode::NO_CONTENT {
-                // エラーが返ってきても成功している場合があるので、社内決済マイクロサービスに問い合わせ
-                let get_res = reqwest::Client::new()
+                // POST may have succeeded even when an error is returned; confirm via GET.
+                let get_res = client
                     .get(format!("{payment_gateway_url}/payments"))
                     .bearer_auth(token)
                     .send()
                     .await
                     .map_err(PaymentGatewayError::Reqwest)?;
 
-                // GET /payments は障害と関係なく200が返るので、200以外は回復不能なエラーとする
+                // GET /payments returns 200 even during incidents; anything else is fatal.
                 if get_res.status() != reqwest::StatusCode::OK {
                     return Err(PaymentGatewayError::GetPayment(get_res.status()).into());
                 }
@@ -102,7 +119,7 @@ where
         if let Err(err) = result {
             if retry < 5 {
                 retry += 1;
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             } else {
                 return Err(err);

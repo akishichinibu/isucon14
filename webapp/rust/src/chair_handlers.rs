@@ -2,10 +2,13 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum_extra::extract::cookie::Cookie;
 use axum_extra::extract::CookieJar;
+use chrono::{DateTime, Utc};
 use ulid::Ulid;
 
-use crate::models::{Chair, ChairLocation, Owner, Ride, RideStatus, User};
-use crate::{AppState, Coordinate, Error};
+use crate::models::{Chair, Owner};
+use crate::{
+    insert_ride_status, AppState, Coordinate, Error, NOTIFICATION_RETRY_AFTER_MS,
+};
 
 pub fn chair_routes(app_state: AppState) -> axum::Router<AppState> {
     let routes =
@@ -55,7 +58,7 @@ async fn chair_post_chairs(
     axum::Json(req): axum::Json<ChairPostChairsRequest>,
 ) -> Result<(CookieJar, (StatusCode, axum::Json<ChairPostChairsResponse>)), Error> {
     let Some(owner): Option<Owner> =
-        sqlx::query_as("SELECT * FROM owners WHERE chair_register_token = ?")
+        sqlx::query_as("SELECT id, name, access_token, created_at, updated_at FROM owners WHERE chair_register_token = ?")
             .bind(req.chair_register_token)
             .fetch_optional(&pool)
             .await?
@@ -96,15 +99,19 @@ struct PostChairActivityRequest {
 }
 
 async fn chair_post_activity(
-    State(AppState { pool, .. }): State<AppState>,
+    State(state): State<AppState>,
     axum::Extension(chair): axum::Extension<Chair>,
     axum::Json(req): axum::Json<PostChairActivityRequest>,
 ) -> Result<StatusCode, Error> {
     sqlx::query("UPDATE chairs SET is_active = ? WHERE id = ?")
         .bind(req.is_active)
-        .bind(chair.id)
-        .execute(&pool)
+        .bind(&chair.id)
+        .execute(&state.pool)
         .await?;
+
+    if req.is_active {
+        crate::spawn_matching(state);
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -112,6 +119,16 @@ async fn chair_post_activity(
 #[derive(Debug, serde::Serialize)]
 struct ChairPostCoordinateResponse {
     recorded_at: i64,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct CurrentRide {
+    id: String,
+    pickup_latitude: i32,
+    pickup_longitude: i32,
+    destination_latitude: i32,
+    destination_longitude: i32,
+    latest_status: String,
 }
 
 async fn chair_post_coordinate(
@@ -132,41 +149,54 @@ async fn chair_post_coordinate(
     .execute(&mut *tx)
     .await?;
 
-    let location: ChairLocation = sqlx::query_as("SELECT * FROM chair_locations WHERE id = ?")
-        .bind(chair_location_id)
-        .fetch_one(&mut *tx)
-        .await?;
+    // Atomically bump cumulative distance from the previous denormalized coordinate.
+    sqlx::query(
+        r#"UPDATE chairs
+           SET total_distance = total_distance + IF(latitude IS NULL, 0, ABS(latitude - ?) + ABS(longitude - ?)),
+               latitude = ?,
+               longitude = ?,
+               total_distance_updated_at = CURRENT_TIMESTAMP(6)
+           WHERE id = ?"#,
+    )
+    .bind(req.latitude)
+    .bind(req.longitude)
+    .bind(req.latitude)
+    .bind(req.longitude)
+    .bind(&chair.id)
+    .execute(&mut *tx)
+    .await?;
 
-    let ride: Option<Ride> =
-        sqlx::query_as("SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC LIMIT 1")
-            .bind(chair.id)
-            .fetch_optional(&mut *tx)
+    let recorded_at: DateTime<Utc> =
+        sqlx::query_scalar("SELECT created_at FROM chair_locations WHERE id = ?")
+            .bind(chair_location_id)
+            .fetch_one(&mut *tx)
             .await?;
+
+    let ride: Option<CurrentRide> = sqlx::query_as(
+        r#"SELECT id, pickup_latitude, pickup_longitude, destination_latitude, destination_longitude, latest_status
+           FROM rides
+           WHERE chair_id = ? AND latest_status <> 'COMPLETED'
+           ORDER BY updated_at DESC
+           LIMIT 1"#,
+    )
+    .bind(&chair.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
     if let Some(ride) = ride {
-        let status = crate::get_latest_ride_status(&mut *tx, &ride.id).await?;
-        if status != "COMPLETED" && status != "CANCELED" {
+        if ride.latest_status != "CANCELED" {
             if req.latitude == ride.pickup_latitude
                 && req.longitude == ride.pickup_longitude
-                && status == "ENROUTE"
+                && ride.latest_status == "ENROUTE"
             {
-                sqlx::query("INSERT INTO ride_statuses (id, ride_id, status) VALUES (?, ?, ?)")
-                    .bind(Ulid::new().to_string())
-                    .bind(&ride.id)
-                    .bind("PICKUP")
-                    .execute(&mut *tx)
-                    .await?;
+                insert_ride_status(&mut tx, &ride.id, "PICKUP").await?;
             }
 
             if req.latitude == ride.destination_latitude
                 && req.longitude == ride.destination_longitude
-                && status == "CARRYING"
+                && ride.latest_status == "CARRYING"
             {
-                sqlx::query("INSERT INTO ride_statuses (id, ride_id, status) VALUES (?, ?, ?)")
-                    .bind(Ulid::new().to_string())
-                    .bind(&ride.id)
-                    .bind("ARRIVED")
-                    .execute(&mut *tx)
-                    .await?;
+                insert_ride_status(&mut tx, &ride.id, "ARRIVED").await?;
             }
         }
     }
@@ -174,7 +204,7 @@ async fn chair_post_coordinate(
     tx.commit().await?;
 
     Ok(axum::Json(ChairPostCoordinateResponse {
-        recorded_at: location.created_at.timestamp_millis(),
+        recorded_at: recorded_at.timestamp_millis(),
     }))
 }
 
@@ -187,7 +217,7 @@ struct SimpleUser {
 #[derive(Debug, serde::Serialize)]
 struct ChairGetNotificationResponse {
     data: Option<ChairGetNotificationResponseData>,
-    retry_after_ms: Option<i32>,
+    retry_after_ms: i32,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -199,47 +229,62 @@ struct ChairGetNotificationResponseData {
     status: String,
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct ChairRideRow {
+    id: String,
+    user_id: String,
+    pickup_latitude: i32,
+    pickup_longitude: i32,
+    destination_latitude: i32,
+    destination_longitude: i32,
+    latest_status: String,
+}
+
 async fn chair_get_notification(
     State(AppState { pool, .. }): State<AppState>,
     axum::Extension(chair): axum::Extension<Chair>,
 ) -> Result<axum::Json<ChairGetNotificationResponse>, Error> {
-    let mut tx = pool.begin().await?;
-
-    let Some(ride): Option<Ride> =
-        sqlx::query_as("SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC LIMIT 1")
-            .bind(&chair.id)
-            .fetch_optional(&mut *tx)
-            .await?
+    let Some(ride): Option<ChairRideRow> = sqlx::query_as(
+        r#"SELECT id, user_id, pickup_latitude, pickup_longitude, destination_latitude, destination_longitude, latest_status
+           FROM rides
+           WHERE chair_id = ?
+           ORDER BY updated_at DESC
+           LIMIT 1"#,
+    )
+    .bind(&chair.id)
+    .fetch_optional(&pool)
+    .await?
     else {
         return Ok(axum::Json(ChairGetNotificationResponse {
             data: None,
-            retry_after_ms: Some(30),
+            retry_after_ms: NOTIFICATION_RETRY_AFTER_MS,
         }));
     };
 
-    let yet_sent_ride_status: Option<RideStatus> =
-        sqlx::query_as("SELECT * FROM ride_statuses WHERE ride_id = ? AND chair_sent_at IS NULL ORDER BY created_at ASC LIMIT 1")
-        .bind(&ride.id)
-        .fetch_optional(&mut *tx)
-        .await?;
-    let (yet_sent_ride_status_id, status) = if let Some(yet_sent_ride_status) = yet_sent_ride_status
-    {
-        (Some(yet_sent_ride_status.id), yet_sent_ride_status.status)
+    let mut tx = pool.begin().await?;
+
+    let yet_sent: Option<(String, String)> = sqlx::query_as(
+        "SELECT id, status FROM ride_statuses WHERE ride_id = ? AND chair_sent_at IS NULL ORDER BY created_at ASC LIMIT 1",
+    )
+    .bind(&ride.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let (yet_sent_id, status) = if let Some((id, status)) = yet_sent {
+        (Some(id), status)
     } else {
-        (
-            None,
-            crate::get_latest_ride_status(&mut *tx, &ride.id).await?,
-        )
+        (None, ride.latest_status)
     };
 
-    let user: User = sqlx::query_as("SELECT * FROM users WHERE id = ? FOR SHARE")
-        .bind(ride.user_id)
-        .fetch_one(&mut *tx)
-        .await?;
+    let user: (String, String, String) =
+        sqlx::query_as("SELECT id, firstname, lastname FROM users WHERE id = ?")
+            .bind(&ride.user_id)
+            .fetch_one(&mut *tx)
+            .await?;
 
-    if let Some(yet_sent_ride_status_id) = yet_sent_ride_status_id {
+    if let Some(yet_sent_id) = yet_sent_id {
         sqlx::query("UPDATE ride_statuses SET chair_sent_at = CURRENT_TIMESTAMP(6) WHERE id = ?")
-            .bind(yet_sent_ride_status_id)
+            .bind(yet_sent_id)
             .execute(&mut *tx)
             .await?;
     }
@@ -250,8 +295,8 @@ async fn chair_get_notification(
         data: Some(ChairGetNotificationResponseData {
             ride_id: ride.id,
             user: SimpleUser {
-                id: user.id,
-                name: format!("{} {}", user.firstname, user.lastname),
+                id: user.0,
+                name: format!("{} {}", user.1, user.2),
             },
             pickup_coordinate: Coordinate {
                 latitude: ride.pickup_latitude,
@@ -263,7 +308,7 @@ async fn chair_get_notification(
             },
             status,
         }),
-        retry_after_ms: Some(30),
+        retry_after_ms: NOTIFICATION_RETRY_AFTER_MS,
     }))
 }
 
@@ -280,40 +325,28 @@ async fn chair_post_ride_status(
 ) -> Result<StatusCode, Error> {
     let mut tx = pool.begin().await?;
 
-    let Some(ride): Option<Ride> = sqlx::query_as("SELECT * FROM rides WHERE id = ? FOR UPDATE")
-        .bind(ride_id)
-        .fetch_optional(&mut *tx)
-        .await?
+    let Some(ride): Option<(Option<String>, String)> =
+        sqlx::query_as("SELECT chair_id, latest_status FROM rides WHERE id = ? FOR UPDATE")
+            .bind(&ride_id)
+            .fetch_optional(&mut *tx)
+            .await?
     else {
         return Err(Error::NotFound("rides not found"));
     };
 
-    if ride.chair_id.is_none_or(|chair_id| chair_id != chair.id) {
+    if ride.0.as_deref() != Some(chair.id.as_str()) {
         return Err(Error::BadRequest("not assigned to this ride"));
     }
 
     match req.status.as_str() {
-        // Acknowledge the ride
         "ENROUTE" => {
-            sqlx::query("INSERT INTO ride_statuses (id, ride_id, status) VALUES (?, ?, ?)")
-                .bind(Ulid::new().to_string())
-                .bind(ride.id)
-                .bind("ENROUTE")
-                .execute(&mut *tx)
-                .await?;
+            insert_ride_status(&mut tx, &ride_id, "ENROUTE").await?;
         }
-        // After Picking up user
         "CARRYING" => {
-            let status = crate::get_latest_ride_status(&mut *tx, &ride.id).await?;
-            if status != "PICKUP" {
+            if ride.1 != "PICKUP" {
                 return Err(Error::BadRequest("chair has not arrived yet"));
             }
-            sqlx::query("INSERT INTO ride_statuses (id, ride_id, status) VALUES (?, ?, ?)")
-                .bind(Ulid::new().to_string())
-                .bind(ride.id)
-                .bind("CARRYING")
-                .execute(&mut *tx)
-                .await?;
+            insert_ride_status(&mut tx, &ride_id, "CARRYING").await?;
         }
         _ => {
             return Err(Error::BadRequest("invalid status"));

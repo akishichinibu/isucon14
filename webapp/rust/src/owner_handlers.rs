@@ -6,7 +6,7 @@ use axum_extra::extract::cookie::Cookie;
 use axum_extra::extract::CookieJar;
 use chrono::{DateTime, NaiveDate, Utc};
 
-use crate::models::{Chair, Owner, Ride};
+use crate::models::Owner;
 use crate::{AppState, Error};
 
 pub fn owner_routes(app_state: AppState) -> axum::Router<AppState> {
@@ -94,6 +94,22 @@ struct GetOwnerSalesQuery {
     until: Option<i64>,
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct OwnerChairRow {
+    id: String,
+    name: String,
+    model: String,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct CompletedRideRow {
+    chair_id: String,
+    pickup_latitude: i32,
+    pickup_longitude: i32,
+    destination_latitude: i32,
+    destination_longitude: i32,
+}
+
 async fn owner_get_sales(
     State(AppState { pool, .. }): State<AppState>,
     axum::Extension(owner): axum::Extension<Owner>,
@@ -116,38 +132,51 @@ async fn owner_get_sales(
         )
     };
 
-    let mut tx = pool.begin().await?;
+    let chairs: Vec<OwnerChairRow> =
+        sqlx::query_as("SELECT id, name, model FROM chairs WHERE owner_id = ?")
+            .bind(&owner.id)
+            .fetch_all(&pool)
+            .await?;
 
-    let chairs: Vec<Chair> = sqlx::query_as("SELECT * FROM chairs WHERE owner_id = ?")
-        .bind(&owner.id)
-        .fetch_all(&mut *tx)
-        .await?;
+    let rides: Vec<CompletedRideRow> = sqlx::query_as(
+        r#"SELECT r.chair_id, r.pickup_latitude, r.pickup_longitude, r.destination_latitude, r.destination_longitude
+           FROM rides r
+           INNER JOIN chairs c ON c.id = r.chair_id
+           WHERE c.owner_id = ?
+             AND r.latest_status = 'COMPLETED'
+             AND r.updated_at BETWEEN ? AND ? + INTERVAL 999 MICROSECOND"#,
+    )
+    .bind(&owner.id)
+    .bind(since)
+    .bind(until)
+    .fetch_all(&pool)
+    .await?;
+
+    let mut sales_by_chair: HashMap<String, i32> = HashMap::new();
+    for ride in rides {
+        *sales_by_chair.entry(ride.chair_id).or_insert(0) += crate::calculate_fare(
+            ride.pickup_latitude,
+            ride.pickup_longitude,
+            ride.destination_latitude,
+            ride.destination_longitude,
+        );
+    }
 
     let mut res = OwnerGetSalesResponse {
         total_sales: 0,
         chairs: Vec::with_capacity(chairs.len()),
         models: Vec::new(),
     };
-
-    let mut model_sales_by_model = HashMap::new();
+    let mut model_sales_by_model: HashMap<String, i32> = HashMap::new();
 
     for chair in chairs {
-        let reqs: Vec<Ride> = sqlx::query_as("SELECT rides.* FROM rides JOIN ride_statuses ON rides.id = ride_statuses.ride_id WHERE chair_id = ? AND status = 'COMPLETED' AND updated_at BETWEEN ? AND ? + INTERVAL 999 MICROSECOND")
-            .bind(&chair.id)
-            .bind(since)
-            .bind(until)
-            .fetch_all(&mut *tx)
-            .await?;
-
-        let sales = sum_sales(&reqs);
+        let sales = sales_by_chair.get(&chair.id).copied().unwrap_or(0);
         res.total_sales += sales;
-
         res.chairs.push(ChairSales {
             id: chair.id,
             name: chair.name,
             sales,
         });
-
         *model_sales_by_model.entry(chair.model).or_insert(0) += sales;
     }
 
@@ -158,71 +187,14 @@ async fn owner_get_sales(
     Ok(axum::Json(res))
 }
 
-fn sum_sales(rides: &[Ride]) -> i32 {
-    rides.iter().map(calculate_sale).sum()
-}
-
-fn calculate_sale(ride: &crate::models::Ride) -> i32 {
-    crate::calculate_fare(
-        ride.pickup_latitude,
-        ride.pickup_longitude,
-        ride.destination_latitude,
-        ride.destination_longitude,
-    )
-}
-
-/// MySQL で COUNT()、SUM() 等を使って DECIMAL 型の値になったものを i64 に変換するための構造体。
-#[derive(Debug)]
-struct MysqlDecimal(i64);
-impl sqlx::Decode<'_, sqlx::MySql> for MysqlDecimal {
-    fn decode(
-        value: sqlx::mysql::MySqlValueRef,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        use sqlx::{Type as _, ValueRef as _};
-
-        let type_info = value.type_info();
-        if i64::compatible(&type_info) {
-            i64::decode(value).map(Self)
-        } else if u64::compatible(&type_info) {
-            let n = u64::decode(value)?.try_into()?;
-            Ok(Self(n))
-        } else if sqlx::types::Decimal::compatible(&type_info) {
-            use num_traits::ToPrimitive as _;
-            let n = sqlx::types::Decimal::decode(value)?
-                .to_i64()
-                .expect("failed to convert DECIMAL type to i64");
-            Ok(Self(n))
-        } else {
-            panic!("MysqlDecimal is used with unknown type: {type_info:?}");
-        }
-    }
-}
-impl sqlx::Type<sqlx::MySql> for MysqlDecimal {
-    fn type_info() -> sqlx::mysql::MySqlTypeInfo {
-        i64::type_info()
-    }
-
-    fn compatible(ty: &sqlx::mysql::MySqlTypeInfo) -> bool {
-        i64::compatible(ty) || u64::compatible(ty) || sqlx::types::Decimal::compatible(ty)
-    }
-}
-impl From<MysqlDecimal> for i64 {
-    fn from(value: MysqlDecimal) -> Self {
-        value.0
-    }
-}
-
 #[derive(Debug, sqlx::FromRow)]
 struct ChairWithDetail {
     id: String,
-    owner_id: String,
     name: String,
-    access_token: String,
     model: String,
     is_active: bool,
     created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-    total_distance: MysqlDecimal,
+    total_distance: i64,
     total_distance_updated_at: Option<DateTime<Utc>>,
 }
 
@@ -247,28 +219,16 @@ async fn owner_get_chairs(
     State(AppState { pool, .. }): State<AppState>,
     axum::Extension(owner): axum::Extension<Owner>,
 ) -> Result<axum::Json<OwnerGetChairResponse>, Error> {
-    let chairs: Vec<ChairWithDetail> = sqlx::query_as(r#"SELECT id,
-       owner_id,
-       name,
-       access_token,
-       model,
-       is_active,
-       created_at,
-       updated_at,
-       IFNULL(total_distance, 0) AS total_distance,
-       total_distance_updated_at
-FROM chairs
-       LEFT JOIN (SELECT chair_id,
-                          SUM(IFNULL(distance, 0)) AS total_distance,
-                          MAX(created_at)          AS total_distance_updated_at
-                   FROM (SELECT chair_id,
-                                created_at,
-                                ABS(latitude - LAG(latitude) OVER (PARTITION BY chair_id ORDER BY created_at)) +
-                                ABS(longitude - LAG(longitude) OVER (PARTITION BY chair_id ORDER BY created_at)) AS distance
-                         FROM chair_locations) tmp
-                   GROUP BY chair_id) distance_table ON distance_table.chair_id = chairs.id
-WHERE owner_id = ?
-    "#).bind(owner.id).fetch_all(&pool).await?;
+    let chairs: Vec<ChairWithDetail> = sqlx::query_as(
+        r#"SELECT id, name, model, is_active, created_at,
+                  CAST(total_distance AS SIGNED) AS total_distance,
+                  total_distance_updated_at
+           FROM chairs
+           WHERE owner_id = ?"#,
+    )
+    .bind(owner.id)
+    .fetch_all(&pool)
+    .await?;
 
     Ok(axum::Json(OwnerGetChairResponse {
         chairs: chairs
@@ -279,7 +239,7 @@ WHERE owner_id = ?
                 model: chair.model,
                 active: chair.is_active,
                 registered_at: chair.created_at.timestamp_millis(),
-                total_distance: chair.total_distance.0,
+                total_distance: chair.total_distance,
                 total_distance_updated_at: chair
                     .total_distance_updated_at
                     .map(|t| t.timestamp_millis()),

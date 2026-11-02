@@ -3,8 +3,10 @@ use axum::http::StatusCode;
 use axum_extra::extract::CookieJar;
 use ulid::Ulid;
 
-use crate::models::{Chair, ChairLocation, Coupon, Owner, PaymentToken, Ride, RideStatus, User};
-use crate::{AppState, Coordinate, Error};
+use crate::models::{Coupon, PaymentToken, Ride, User};
+use crate::{
+    discounted_fare, insert_ride_status, AppState, Coordinate, Error, NOTIFICATION_RETRY_AFTER_MS,
+};
 
 pub fn app_routes(app_state: AppState) -> axum::Router<AppState> {
     let routes = axum::Router::new().route("/api/app/users", axum::routing::post(app_post_users));
@@ -79,7 +81,7 @@ async fn app_post_users(
         .execute(&mut *tx)
         .await?;
 
-    // 初回登録キャンペーンのクーポンを付与
+    // Welcome coupon for new registrations
     sqlx::query("INSERT INTO coupons (user_id, code, discount) VALUES (?, ?, ?)")
         .bind(&user_id)
         .bind("CP_NEW2024")
@@ -87,10 +89,8 @@ async fn app_post_users(
         .execute(&mut *tx)
         .await?;
 
-    // 招待コードを使った登録
     if let Some(req_invitation_code) = req.invitation_code {
         if !req_invitation_code.is_empty() {
-            // 招待する側の招待数をチェック
             let coupons: Vec<Coupon> =
                 sqlx::query_as("SELECT * FROM coupons WHERE code = ? FOR UPDATE")
                     .bind(format!("INV_{req_invitation_code}"))
@@ -100,9 +100,8 @@ async fn app_post_users(
                 return Err(Error::BadRequest("この招待コードは使用できません。"));
             }
 
-            // ユーザーチェック
             let Some(inviter): Option<User> =
-                sqlx::query_as("SELECT * FROM users WHERE invitation_code = ?")
+                sqlx::query_as("SELECT id, username, firstname, lastname, date_of_birth, access_token, created_at, updated_at FROM users WHERE invitation_code = ?")
                     .bind(&req_invitation_code)
                     .fetch_optional(&mut *tx)
                     .await?
@@ -110,14 +109,12 @@ async fn app_post_users(
                 return Err(Error::BadRequest("この招待コードは使用できません。"));
             };
 
-            // 招待クーポン付与
             sqlx::query("INSERT INTO coupons (user_id, code, discount) VALUES (?, ?, ?)")
                 .bind(&user_id)
                 .bind(format!("INV_{req_invitation_code}"))
                 .bind(1500)
                 .execute(&mut *tx)
                 .await?;
-            // 招待した人にもRewardを付与
             sqlx::query("INSERT INTO coupons (user_id, code, discount) VALUES (?, CONCAT(?, '_', FLOOR(UNIX_TIMESTAMP(NOW(3))*1000)), ?)")
                 .bind(inviter.id)
                 .bind(format!("RWD_{req_invitation_code}"))
@@ -188,47 +185,55 @@ struct GetAppRidesResponseItemChair {
     model: String,
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct CompletedRideItem {
+    id: String,
+    pickup_latitude: i32,
+    pickup_longitude: i32,
+    destination_latitude: i32,
+    destination_longitude: i32,
+    evaluation: i32,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    chair_id: String,
+    chair_name: String,
+    chair_model: String,
+    owner_name: String,
+    discount: Option<i32>,
+}
+
 async fn app_get_rides(
     State(AppState { pool, .. }): State<AppState>,
     axum::Extension(user): axum::Extension<User>,
 ) -> Result<axum::Json<GetAppRidesResponse>, Error> {
-    let mut tx = pool.begin().await?;
+    let rides: Vec<CompletedRideItem> = sqlx::query_as(
+        r#"SELECT r.id,
+                  r.pickup_latitude,
+                  r.pickup_longitude,
+                  r.destination_latitude,
+                  r.destination_longitude,
+                  r.evaluation,
+                  r.created_at,
+                  r.updated_at,
+                  c.id AS chair_id,
+                  c.name AS chair_name,
+                  c.model AS chair_model,
+                  o.name AS owner_name,
+                  cp.discount AS discount
+           FROM rides r
+           INNER JOIN chairs c ON c.id = r.chair_id
+           INNER JOIN owners o ON o.id = c.owner_id
+           LEFT JOIN coupons cp ON cp.used_by = r.id
+           WHERE r.user_id = ? AND r.latest_status = 'COMPLETED'
+           ORDER BY r.created_at DESC"#,
+    )
+    .bind(&user.id)
+    .fetch_all(&pool)
+    .await?;
 
-    let rides: Vec<Ride> =
-        sqlx::query_as("SELECT * FROM rides WHERE user_id = ? ORDER BY created_at DESC")
-            .bind(&user.id)
-            .fetch_all(&mut *tx)
-            .await?;
-
-    let mut items = Vec::with_capacity(rides.len());
-    for ride in rides {
-        let status = crate::get_latest_ride_status(&mut *tx, &ride.id).await?;
-        if status != "COMPLETED" {
-            continue;
-        }
-
-        let fare = calculate_discounted_fare(
-            &mut tx,
-            &user.id,
-            Some(&ride),
-            ride.pickup_latitude,
-            ride.pickup_longitude,
-            ride.destination_latitude,
-            ride.destination_longitude,
-        )
-        .await?;
-
-        let chair: Chair = sqlx::query_as("SELECT * FROM chairs WHERE id = ?")
-            .bind(&ride.chair_id)
-            .fetch_one(&mut *tx)
-            .await?;
-
-        let owner: Owner = sqlx::query_as("SELECT * FROM owners WHERE id = ?")
-            .bind(chair.owner_id)
-            .fetch_one(&mut *tx)
-            .await?;
-
-        items.push(GetAppRidesResponseItem {
+    let items = rides
+        .into_iter()
+        .map(|ride| GetAppRidesResponseItem {
             id: ride.id,
             pickup_coordinate: Coordinate {
                 latitude: ride.pickup_latitude,
@@ -239,19 +244,23 @@ async fn app_get_rides(
                 longitude: ride.destination_longitude,
             },
             chair: GetAppRidesResponseItemChair {
-                id: chair.id,
-                owner: owner.name,
-                name: chair.name,
-                model: chair.model,
+                id: ride.chair_id,
+                owner: ride.owner_name,
+                name: ride.chair_name,
+                model: ride.chair_model,
             },
-            fare,
-            evaluation: ride.evaluation.unwrap(),
+            fare: discounted_fare(
+                ride.pickup_latitude,
+                ride.pickup_longitude,
+                ride.destination_latitude,
+                ride.destination_longitude,
+                ride.discount.unwrap_or(0),
+            ),
+            evaluation: ride.evaluation,
             requested_at: ride.created_at.timestamp_millis(),
             completed_at: ride.updated_at.timestamp_millis(),
-        });
-    }
-
-    tx.commit().await?;
+        })
+        .collect();
 
     Ok(axum::Json(GetAppRidesResponse { rides: items }))
 }
@@ -269,32 +278,26 @@ struct AppPostRidesResponse {
 }
 
 async fn app_post_rides(
-    State(AppState { pool, .. }): State<AppState>,
+    State(state): State<AppState>,
     axum::Extension(user): axum::Extension<User>,
     axum::Json(req): axum::Json<AppPostRidesRequest>,
 ) -> Result<(StatusCode, axum::Json<AppPostRidesResponse>), Error> {
     let ride_id = Ulid::new().to_string();
 
-    let mut tx = pool.begin().await?;
+    let mut tx = state.pool.begin().await?;
 
-    let rides: Vec<Ride> = sqlx::query_as("SELECT * FROM rides WHERE user_id = ?")
-        .bind(&user.id)
-        .fetch_all(&mut *tx)
-        .await?;
+    let continuing: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM rides WHERE user_id = ? AND latest_status <> 'COMPLETED')",
+    )
+    .bind(&user.id)
+    .fetch_one(&mut *tx)
+    .await?;
 
-    let mut continuing_ride_count = 0;
-    for ride in rides {
-        let status = crate::get_latest_ride_status(&mut *tx, &ride.id).await?;
-        if status != "COMPLETED" {
-            continuing_ride_count += 1;
-        }
-    }
-
-    if continuing_ride_count > 0 {
+    if continuing != 0 {
         return Err(Error::Conflict("ride already exists"));
     }
 
-    sqlx::query("INSERT INTO rides (id, user_id, pickup_latitude, pickup_longitude, destination_latitude, destination_longitude) VALUES (?, ?, ?, ?, ?, ?)")
+    sqlx::query("INSERT INTO rides (id, user_id, pickup_latitude, pickup_longitude, destination_latitude, destination_longitude, latest_status) VALUES (?, ?, ?, ?, ?, ?, 'MATCHING')")
         .bind(&ride_id)
         .bind(&user.id)
         .bind(req.pickup_coordinate.latitude)
@@ -317,7 +320,6 @@ async fn app_post_rides(
         .await?;
 
     if ride_count == 1 {
-        // 初回利用で、初回利用クーポンがあれば必ず使う
         let coupon: Option<Coupon> = sqlx::query_as("SELECT * FROM coupons WHERE user_id = ? AND code = 'CP_NEW2024' AND used_by IS NULL FOR UPDATE")
             .bind(&user.id)
             .fetch_optional(&mut *tx)
@@ -329,7 +331,6 @@ async fn app_post_rides(
                 .execute(&mut *tx)
                 .await?;
         } else {
-            // 無ければ他のクーポンを付与された順番に使う
             let coupon: Option<Coupon> = sqlx::query_as("SELECT * FROM coupons WHERE user_id = ? AND used_by IS NULL ORDER BY created_at LIMIT 1 FOR UPDATE")
                 .bind(&user.id)
                 .fetch_optional(&mut *tx)
@@ -344,7 +345,6 @@ async fn app_post_rides(
             }
         }
     } else {
-        // 他のクーポンを付与された順番に使う
         let coupon: Option<Coupon> = sqlx::query_as("SELECT * FROM coupons WHERE user_id = ? AND used_by IS NULL ORDER BY created_at LIMIT 1 FOR UPDATE")
                 .bind(&user.id)
                 .fetch_optional(&mut *tx)
@@ -376,6 +376,8 @@ async fn app_post_rides(
     .await?;
 
     tx.commit().await?;
+
+    crate::spawn_matching(state);
 
     Ok((
         StatusCode::ACCEPTED,
@@ -438,7 +440,7 @@ struct AppPostRideEvaluationResponse {
 }
 
 async fn app_post_ride_evaluation(
-    State(AppState { pool, .. }): State<AppState>,
+    State(state): State<AppState>,
     Path((ride_id,)): Path<(String,)>,
     axum::Json(req): axum::Json<AppPostRideEvaluationRequest>,
 ) -> Result<axum::Json<AppPostRideEvaluationResponse>, Error> {
@@ -446,7 +448,7 @@ async fn app_post_ride_evaluation(
         return Err(Error::BadRequest("evaluation must be between 1 and 5"));
     }
 
-    let mut tx = pool.begin().await?;
+    let mut tx = state.pool.begin().await?;
 
     let Some(ride): Option<Ride> = sqlx::query_as("SELECT * FROM rides WHERE id = ?")
         .bind(&ride_id)
@@ -455,9 +457,8 @@ async fn app_post_ride_evaluation(
     else {
         return Err(Error::NotFound("ride not found"));
     };
-    let status = crate::get_latest_ride_status(&mut *tx, &ride.id).await?;
 
-    if status != "ARRIVED" {
+    if ride.latest_status != "ARRIVED" {
         return Err(Error::BadRequest("not arrived yet"));
     }
 
@@ -471,12 +472,17 @@ async fn app_post_ride_evaluation(
         return Err(Error::NotFound("ride not found"));
     }
 
-    sqlx::query("INSERT INTO ride_statuses (id, ride_id, status) VALUES (?, ?, ?)")
-        .bind(Ulid::new().to_string())
-        .bind(&ride_id)
-        .bind("COMPLETED")
+    insert_ride_status(&mut tx, &ride_id, "COMPLETED").await?;
+
+    if let Some(chair_id) = ride.chair_id.as_ref() {
+        sqlx::query(
+            "UPDATE chairs SET total_rides_count = total_rides_count + 1, total_evaluation_sum = total_evaluation_sum + ? WHERE id = ?",
+        )
+        .bind(req.evaluation)
+        .bind(chair_id)
         .execute(&mut *tx)
         .await?;
+    }
 
     let Some(ride): Option<Ride> = sqlx::query_as("SELECT * FROM rides WHERE id = ?")
         .bind(&ride_id)
@@ -526,6 +532,7 @@ async fn app_post_ride_evaluation(
         &payment_gateway_url,
         &payment_token.token,
         &crate::payment_gateway::PaymentGatewayPostPaymentRequest { amount: fare },
+        &ride.id,
         &mut tx,
         &ride.user_id,
         retrieve_rides_order_by_created_at_asc,
@@ -533,6 +540,8 @@ async fn app_post_ride_evaluation(
     .await?;
 
     tx.commit().await?;
+
+    crate::spawn_matching(state);
 
     Ok(axum::Json(AppPostRideEvaluationResponse {
         fare,
@@ -543,7 +552,7 @@ async fn app_post_ride_evaluation(
 #[derive(Debug, serde::Serialize)]
 struct AppGetNotificationResponse {
     data: Option<AppGetNotificationResponseData>,
-    retry_after_ms: Option<i32>,
+    retry_after_ms: i32,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -573,35 +582,43 @@ struct AppGetNotificationResponseChairStats {
     total_evaluation_avg: f64,
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct ChairStatsRow {
+    id: String,
+    name: String,
+    model: String,
+    total_rides_count: i32,
+    total_evaluation_sum: i32,
+}
+
 async fn app_get_notification(
     State(AppState { pool, .. }): State<AppState>,
     axum::Extension(user): axum::Extension<User>,
 ) -> Result<axum::Json<AppGetNotificationResponse>, Error> {
-    let mut tx = pool.begin().await?;
-
     let Some(ride): Option<Ride> =
         sqlx::query_as("SELECT * FROM rides WHERE user_id = ? ORDER BY created_at DESC LIMIT 1")
             .bind(&user.id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&pool)
             .await?
     else {
         return Ok(axum::Json(AppGetNotificationResponse {
             data: None,
-            retry_after_ms: Some(30),
+            retry_after_ms: NOTIFICATION_RETRY_AFTER_MS,
         }));
     };
 
-    let yet_sent_ride_status: Option<RideStatus> = sqlx::query_as("SELECT * FROM ride_statuses WHERE ride_id = ? AND app_sent_at IS NULL ORDER BY created_at ASC LIMIT 1")
-        .bind(&ride.id)
-        .fetch_optional(&mut *tx)
-        .await?;
-    let (ride_status_id, status) = if let Some(yet_sent_ride_status) = yet_sent_ride_status {
-        (Some(yet_sent_ride_status.id), yet_sent_ride_status.status)
+    let mut tx = pool.begin().await?;
+
+    let yet_sent: Option<(String, String)> = sqlx::query_as(
+        "SELECT id, status FROM ride_statuses WHERE ride_id = ? AND app_sent_at IS NULL ORDER BY created_at ASC LIMIT 1",
+    )
+    .bind(&ride.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let (ride_status_id, status) = if let Some((id, status)) = yet_sent {
+        (Some(id), status)
     } else {
-        (
-            None,
-            crate::get_latest_ride_status(&mut *tx, &ride.id).await?,
-        )
+        (None, ride.latest_status.clone())
     };
 
     let fare = calculate_discounted_fare(
@@ -633,18 +650,27 @@ async fn app_get_notification(
     };
 
     if let Some(chair_id) = ride.chair_id {
-        let chair: Chair = sqlx::query_as("SELECT * FROM chairs WHERE id = ?")
-            .bind(chair_id)
-            .fetch_one(&mut *tx)
-            .await?;
+        let chair: ChairStatsRow = sqlx::query_as(
+            "SELECT id, name, model, total_rides_count, total_evaluation_sum FROM chairs WHERE id = ?",
+        )
+        .bind(chair_id)
+        .fetch_one(&mut *tx)
+        .await?;
 
-        let stats = get_chair_stats(&mut tx, &chair.id).await?;
+        let total_evaluation_avg = if chair.total_rides_count > 0 {
+            chair.total_evaluation_sum as f64 / chair.total_rides_count as f64
+        } else {
+            0.0
+        };
 
         data.chair = Some(AppGetNotificationResponseChair {
             id: chair.id,
             name: chair.name,
             model: chair.model,
-            stats,
+            stats: AppGetNotificationResponseChairStats {
+                total_rides_count: chair.total_rides_count,
+                total_evaluation_avg,
+            },
         });
     }
 
@@ -659,62 +685,8 @@ async fn app_get_notification(
 
     Ok(axum::Json(AppGetNotificationResponse {
         data: Some(data),
-        retry_after_ms: Some(30),
+        retry_after_ms: NOTIFICATION_RETRY_AFTER_MS,
     }))
-}
-
-async fn get_chair_stats(
-    tx: &mut sqlx::MySqlConnection,
-    chair_id: &str,
-) -> Result<AppGetNotificationResponseChairStats, Error> {
-    let rides: Vec<Ride> =
-        sqlx::query_as("SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC")
-            .bind(chair_id)
-            .fetch_all(&mut *tx)
-            .await?;
-
-    let mut total_ride_count = 0;
-    let mut total_evaluation = 0.0;
-    for ride in rides {
-        let ride_statuses: Vec<RideStatus> =
-            sqlx::query_as("SELECT * FROM ride_statuses WHERE ride_id = ? ORDER BY created_at")
-                .bind(&ride.id)
-                .fetch_all(&mut *tx)
-                .await?;
-
-        if !ride_statuses
-            .iter()
-            .any(|status| status.status == "ARRIVED")
-        {
-            continue;
-        }
-        if !ride_statuses
-            .iter()
-            .any(|status| (status.status == "CARRYING"))
-        {
-            continue;
-        }
-        let is_completed = ride_statuses
-            .iter()
-            .any(|status| status.status == "COMPLETED");
-        if !is_completed {
-            continue;
-        }
-
-        total_ride_count += 1;
-        total_evaluation += ride.evaluation.unwrap() as f64;
-    }
-
-    let total_evaluation_avg = if total_ride_count > 0 {
-        total_evaluation / total_ride_count as f64
-    } else {
-        0.0
-    };
-
-    Ok(AppGetNotificationResponseChairStats {
-        total_rides_count: total_ride_count,
-        total_evaluation_avg,
-    })
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -738,84 +710,58 @@ struct AppGetNearbyChairsResponseChair {
     current_coordinate: Coordinate,
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct NearbyChairRow {
+    id: String,
+    name: String,
+    model: String,
+    latitude: i32,
+    longitude: i32,
+}
+
 async fn app_get_nearby_chairs(
     State(AppState { pool, .. }): State<AppState>,
     Query(query): Query<AppGetNearbyChairsQuery>,
 ) -> Result<axum::Json<AppGetNearbyChairsResponse>, Error> {
     let distance = query.distance.unwrap_or(50);
-    let coordinate = Coordinate {
-        latitude: query.latitude,
-        longitude: query.longitude,
-    };
 
-    let mut tx = pool.begin().await?;
+    let nearby_chairs: Vec<NearbyChairRow> = sqlx::query_as(
+        r#"SELECT c.id, c.name, c.model, c.latitude, c.longitude
+           FROM chairs c
+           WHERE c.is_active = TRUE
+             AND c.latitude IS NOT NULL
+             AND c.longitude IS NOT NULL
+             AND ABS(c.latitude - ?) + ABS(c.longitude - ?) <= ?
+             AND NOT EXISTS (
+               SELECT 1 FROM rides r
+               WHERE r.chair_id = c.id AND r.latest_status <> 'COMPLETED'
+             )"#,
+    )
+    .bind(query.latitude)
+    .bind(query.longitude)
+    .bind(distance)
+    .fetch_all(&pool)
+    .await?;
 
-    let chairs: Vec<Chair> = sqlx::query_as("SELECT * FROM chairs")
-        .fetch_all(&mut *tx)
-        .await?;
+    let retrieved_at: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT CURRENT_TIMESTAMP(6)")
+            .fetch_one(&pool)
+            .await?;
 
-    let mut nearby_chairs = Vec::new();
-    for chair in chairs {
-        if !chair.is_active {
-            continue;
-        }
-
-        let rides: Vec<Ride> =
-            sqlx::query_as("SELECT * FROM rides WHERE chair_id = ? ORDER BY created_at DESC")
-                .bind(&chair.id)
-                .fetch_all(&mut *tx)
-                .await?;
-
-        let mut skip = false;
-        for ride in rides {
-            // 過去にライドが存在し、かつ、それが完了していない場合はスキップ
-            let status = crate::get_latest_ride_status(&mut *tx, &ride.id).await?;
-            if status != "COMPLETED" {
-                skip = true;
-                break;
-            }
-        }
-        if skip {
-            continue;
-        }
-
-        // 最新の位置情報を取得
-        let Some(chair_location): Option<ChairLocation> = sqlx::query_as(
-            "SELECT * FROM chair_locations WHERE chair_id = ? ORDER BY created_at DESC LIMIT 1",
-        )
-        .bind(&chair.id)
-        .fetch_optional(&mut *tx)
-        .await?
-        else {
-            continue;
-        };
-        if crate::calculate_distance(
-            coordinate.latitude,
-            coordinate.longitude,
-            chair_location.latitude,
-            chair_location.longitude,
-        ) <= distance
-        {
-            nearby_chairs.push(AppGetNearbyChairsResponseChair {
+    Ok(axum::Json(AppGetNearbyChairsResponse {
+        chairs: nearby_chairs
+            .into_iter()
+            .map(|chair| AppGetNearbyChairsResponseChair {
                 id: chair.id,
                 name: chair.name,
                 model: chair.model,
                 current_coordinate: Coordinate {
-                    latitude: chair_location.latitude,
-                    longitude: chair_location.longitude,
+                    latitude: chair.latitude,
+                    longitude: chair.longitude,
                 },
-            });
-        }
-    }
-
-    let retrieved_at: chrono::DateTime<chrono::Utc> =
-        sqlx::query_scalar("SELECT CURRENT_TIMESTAMP(6)")
-            .fetch_one(&mut *tx)
-            .await?;
-
-    Ok(axum::Json(AppGetNearbyChairsResponse {
-        chairs: nearby_chairs,
-        retrieved_at: retrieved_at.timestamp(),
+            })
+            .collect(),
+        retrieved_at: retrieved_at.timestamp_millis(),
     }))
 }
 
@@ -834,14 +780,12 @@ async fn calculate_discounted_fare(
         pickup_latitude = ride.pickup_latitude;
         pickup_longitude = ride.pickup_longitude;
 
-        // すでにクーポンが紐づいているならそれの割引額を参照
         let coupon: Option<Coupon> = sqlx::query_as("SELECT * FROM coupons WHERE used_by = ?")
             .bind(&ride.id)
             .fetch_optional(&mut *tx)
             .await?;
         coupon.map(|c| c.discount).unwrap_or(0)
     } else {
-        // 初回利用クーポンを最優先で使う
         let coupon: Option<Coupon> = sqlx::query_as(
             "SELECT * FROM coupons WHERE user_id = ? AND code = 'CP_NEW2024' AND used_by IS NULL",
         )
@@ -851,7 +795,6 @@ async fn calculate_discounted_fare(
         if let Some(coupon) = coupon {
             coupon.discount
         } else {
-            // 無いなら他のクーポンを付与された順番に使う
             let coupon: Option<Coupon> = sqlx::query_as("SELECT * FROM coupons WHERE user_id = ? AND used_by IS NULL ORDER BY created_at LIMIT 1")
                 .bind(user_id)
                 .fetch_optional(&mut *tx)
@@ -860,14 +803,11 @@ async fn calculate_discounted_fare(
         }
     };
 
-    let metered_fare = crate::FARE_PER_DISTANCE
-        * crate::calculate_distance(
-            pickup_latitude,
-            pickup_longitude,
-            dest_latitude,
-            dest_longitude,
-        );
-    let discounted_metered_fare = std::cmp::max(metered_fare - discount, 0);
-
-    Ok(crate::INITIAL_FARE + discounted_metered_fare)
+    Ok(discounted_fare(
+        pickup_latitude,
+        pickup_longitude,
+        dest_latitude,
+        dest_longitude,
+        discount,
+    ))
 }

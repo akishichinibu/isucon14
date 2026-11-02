@@ -1,14 +1,18 @@
 use axum::extract::State;
 use isuride::{AppState, Error};
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    if std::env::var_os("RUST_LOG").is_none() {
-        std::env::set_var("RUST_LOG", "info,tower_http=debug,axum::rejection=trace");
-    }
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .init();
 
     let host = std::env::var("ISUCON_DB_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned());
     let port = std::env::var("ISUCON_DB_PORT")
@@ -23,7 +27,9 @@ async fn main() -> anyhow::Result<()> {
     let dbname = std::env::var("ISUCON_DB_NAME").unwrap_or_else(|_| "isuride".to_owned());
 
     let pool = sqlx::mysql::MySqlPoolOptions::new()
-        .max_connections(50)
+        .max_connections(64)
+        .min_connections(8)
+        .acquire_timeout(Duration::from_secs(5))
         .connect_with(
             sqlx::mysql::MySqlConnectOptions::default()
                 .host(&host)
@@ -34,7 +40,24 @@ async fn main() -> anyhow::Result<()> {
         )
         .await?;
 
-    let app_state = AppState { pool };
+    let app_state = AppState {
+        pool,
+        matching_lock: Arc::new(tokio::sync::Mutex::new(())),
+    };
+
+    {
+        let state = app_state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(100));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if let Err(err) = isuride::internal_handlers::try_run_matching(&state).await {
+                    tracing::debug!("matching: {err}");
+                }
+            }
+        });
+    }
 
     let app = axum::Router::new()
         .route("/api/initialize", axum::routing::post(post_initialize))
@@ -42,8 +65,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(isuride::owner_handlers::owner_routes(app_state.clone()))
         .merge(isuride::chair_handlers::chair_routes(app_state.clone()))
         .merge(isuride::internal_handlers::internal_routes())
-        .with_state(app_state)
-        .layer(tower_http::trace::TraceLayer::new_for_http());
+        .with_state(app_state);
 
     let tcp_listener =
         if let Some(std_listener) = listenfd::ListenFd::from_env().take_tcp_listener(0)? {
