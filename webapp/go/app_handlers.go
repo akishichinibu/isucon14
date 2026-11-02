@@ -681,6 +681,11 @@ func appGetNotification(w http.ResponseWriter, r *http.Request) {
 			if err := writeSSE(w, flusher, data); err != nil {
 				return err
 			}
+			if unsent {
+				if _, err := db.ExecContext(ctx, `UPDATE ride_statuses SET app_sent_at = CURRENT_TIMESTAMP(6) WHERE ride_id = ? AND status = ? AND app_sent_at IS NULL ORDER BY created_at ASC LIMIT 1`, data.RideID, data.Status); err != nil {
+					return err
+				}
+			}
 			lastRideID = data.RideID
 			lastStatus = data.Status
 			sentAnything = true
@@ -780,12 +785,6 @@ func fetchAppNotification(ctx context.Context, userID string) (*appGetNotificati
 			Name:  chair.Name,
 			Model: chair.Model,
 			Stats: stats,
-		}
-	}
-
-	if unsent {
-		if _, err := tx.ExecContext(ctx, `UPDATE ride_statuses SET app_sent_at = CURRENT_TIMESTAMP(6) WHERE id = ?`, yetSentRideStatus.ID); err != nil {
-			return nil, false, err
 		}
 	}
 
