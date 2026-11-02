@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/oklog/ulid/v2"
 )
@@ -188,81 +190,126 @@ func chairGetNotification(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	chair := ctx.Value("chair").(*Chair)
 
-	tx, err := db.Beginx()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	defer tx.Rollback()
-	ride := &Ride{}
-	yetSentRideStatus := RideStatus{}
-	status := ""
-
-	if err := tx.GetContext(ctx, ride, `SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC LIMIT 1`, chair.ID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			writeJSON(w, http.StatusOK, &chairGetNotificationResponse{
-				RetryAfterMs: 30,
-			})
-			return
-		}
-		writeError(w, http.StatusInternalServerError, err)
+	flusher, ok := startSSE(w)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, errors.New("streaming unsupported"))
 		return
 	}
 
-	if err := tx.GetContext(ctx, &yetSentRideStatus, `SELECT * FROM ride_statuses WHERE ride_id = ? AND chair_sent_at IS NULL ORDER BY created_at ASC LIMIT 1`, ride.ID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			status, err = getLatestRideStatus(ctx, tx, ride.ID)
+	var lastRideID, lastStatus string
+	sentAnything := false
+
+	process := func() error {
+		for {
+			data, unsent, err := fetchChairNotification(ctx, chair.ID)
 			if err != nil {
-				writeError(w, http.StatusInternalServerError, err)
+				return err
+			}
+			if data == nil {
+				return nil
+			}
+			if unsent || !sentAnything || data.RideID != lastRideID || data.Status != lastStatus {
+				if err := writeSSE(w, flusher, data); err != nil {
+					return err
+				}
+				lastRideID = data.RideID
+				lastStatus = data.Status
+				sentAnything = true
+			}
+			if !unsent {
+				return nil
+			}
+		}
+	}
+
+	if err := process(); err != nil {
+		return
+	}
+
+	ticker := time.NewTicker(notificationPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := process(); err != nil {
 				return
 			}
-		} else {
-			writeError(w, http.StatusInternalServerError, err)
-			return
 		}
+	}
+}
+
+func fetchChairNotification(ctx context.Context, chairID string) (*chairGetNotificationResponseData, bool, error) {
+	tx, err := db.Beginx()
+	if err != nil {
+		return nil, false, err
+	}
+	defer tx.Rollback()
+
+	yetSentRideStatus := RideStatus{}
+	ride := Ride{}
+	unsent := false
+
+	err = tx.GetContext(ctx, &yetSentRideStatus, `
+		SELECT rs.id, rs.ride_id, rs.status, rs.created_at
+		FROM ride_statuses rs
+		INNER JOIN rides r ON r.id = rs.ride_id
+		WHERE r.chair_id = ? AND rs.chair_sent_at IS NULL
+		ORDER BY rs.created_at ASC
+		LIMIT 1`, chairID)
+	if err == nil {
+		unsent = true
+		if err := tx.GetContext(ctx, &ride, `SELECT * FROM rides WHERE id = ?`, yetSentRideStatus.RideID); err != nil {
+			return nil, false, err
+		}
+	} else if errors.Is(err, sql.ErrNoRows) {
+		if err := tx.GetContext(ctx, &ride, `SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC LIMIT 1`, chairID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, false, nil
+			}
+			return nil, false, err
+		}
+		status, err := getLatestRideStatus(ctx, tx, ride.ID)
+		if err != nil {
+			return nil, false, err
+		}
+		yetSentRideStatus.Status = status
 	} else {
-		status = yetSentRideStatus.Status
+		return nil, false, err
 	}
 
 	user := &User{}
-	err = tx.GetContext(ctx, user, "SELECT * FROM users WHERE id = ? FOR SHARE", ride.UserID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+	if err := tx.GetContext(ctx, user, "SELECT id, firstname, lastname FROM users WHERE id = ?", ride.UserID); err != nil {
+		return nil, false, err
 	}
 
-	if yetSentRideStatus.ID != "" {
-		_, err := tx.ExecContext(ctx, `UPDATE ride_statuses SET chair_sent_at = CURRENT_TIMESTAMP(6) WHERE id = ?`, yetSentRideStatus.ID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
+	if unsent {
+		if _, err := tx.ExecContext(ctx, `UPDATE ride_statuses SET chair_sent_at = CURRENT_TIMESTAMP(6) WHERE id = ?`, yetSentRideStatus.ID); err != nil {
+			return nil, false, err
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return nil, false, err
 	}
 
-	writeJSON(w, http.StatusOK, &chairGetNotificationResponse{
-		Data: &chairGetNotificationResponseData{
-			RideID: ride.ID,
-			User: simpleUser{
-				ID:   user.ID,
-				Name: fmt.Sprintf("%s %s", user.Firstname, user.Lastname),
-			},
-			PickupCoordinate: Coordinate{
-				Latitude:  ride.PickupLatitude,
-				Longitude: ride.PickupLongitude,
-			},
-			DestinationCoordinate: Coordinate{
-				Latitude:  ride.DestinationLatitude,
-				Longitude: ride.DestinationLongitude,
-			},
-			Status: status,
+	return &chairGetNotificationResponseData{
+		RideID: ride.ID,
+		User: simpleUser{
+			ID:   user.ID,
+			Name: fmt.Sprintf("%s %s", user.Firstname, user.Lastname),
 		},
-		RetryAfterMs: 30,
-	})
+		PickupCoordinate: Coordinate{
+			Latitude:  ride.PickupLatitude,
+			Longitude: ride.PickupLongitude,
+		},
+		DestinationCoordinate: Coordinate{
+			Latitude:  ride.DestinationLatitude,
+			Longitude: ride.DestinationLongitude,
+		},
+		Status: yetSentRideStatus.Status,
+	}, unsent, nil
 }
 
 type postChairRidesRideIDStatusRequest struct {
