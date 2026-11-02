@@ -654,61 +654,26 @@ type appGetNotificationResponseChairStats struct {
 	TotalEvaluationAvg float64 `json:"total_evaluation_avg"`
 }
 
-const notificationPollInterval = 200 * time.Millisecond
-
 func appGetNotification(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	user := ctx.Value("user").(*User)
 
-	flusher, ok := startSSE(w)
-	if !ok {
-		writeError(w, http.StatusInternalServerError, errors.New("streaming unsupported"))
+	data, unsent, err := fetchAppNotification(ctx, user.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-
-	var lastRideID, lastStatus string
-	sentAnything := false
-
-	process := func() error {
-		data, unsent, err := fetchAppNotification(ctx, user.ID)
-		if err != nil {
-			return err
-		}
-		if data == nil {
-			return nil
-		}
-		if unsent || !sentAnything || data.RideID != lastRideID || data.Status != lastStatus {
-			if err := writeSSE(w, flusher, data); err != nil {
-				return err
-			}
-			if unsent {
-				if _, err := db.ExecContext(ctx, `UPDATE ride_statuses SET app_sent_at = CURRENT_TIMESTAMP(6) WHERE ride_id = ? AND status = ? AND app_sent_at IS NULL ORDER BY created_at ASC LIMIT 1`, data.RideID, data.Status); err != nil {
-					return err
-				}
-			}
-			lastRideID = data.RideID
-			lastStatus = data.Status
-			sentAnything = true
-		}
-		return nil
-	}
-
-	if err := process(); err != nil {
+	if data == nil {
+		writeJSON(w, http.StatusOK, &appGetNotificationResponse{RetryAfterMs: 100})
 		return
 	}
-
-	ticker := time.NewTicker(notificationPollInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
+	if unsent {
+		if _, err := db.ExecContext(ctx, `UPDATE ride_statuses SET app_sent_at = CURRENT_TIMESTAMP(6) WHERE ride_id = ? AND status = ? AND app_sent_at IS NULL ORDER BY created_at ASC LIMIT 1`, data.RideID, data.Status); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
 			return
-		case <-ticker.C:
-			if err := process(); err != nil {
-				return
-			}
 		}
 	}
+	writeJSON(w, http.StatusOK, &appGetNotificationResponse{Data: data, RetryAfterMs: 100})
 }
 
 func fetchAppNotification(ctx context.Context, userID string) (*appGetNotificationResponseData, bool, error) {

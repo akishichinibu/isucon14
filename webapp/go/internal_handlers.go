@@ -113,7 +113,6 @@ WHERE c.is_active = TRUE
     SELECT 1 FROM rides r
     INNER JOIN ride_statuses rs ON rs.ride_id = r.id
       AND rs.status = 'COMPLETED' AND rs.chair_sent_at IS NULL
-      AND rs.created_at > NOW(6) - INTERVAL 500000 MICROSECOND
     WHERE r.chair_id = c.id
   )`); err != nil {
 		return err
@@ -183,7 +182,6 @@ WHERE c.is_active = TRUE
 			       SELECT r.id FROM rides r
 			       INNER JOIN ride_statuses rs ON rs.ride_id = r.id
 			         AND rs.status = 'COMPLETED' AND rs.chair_sent_at IS NULL
-			         AND rs.created_at > NOW(6) - INTERVAL 500000 MICROSECOND
 			       WHERE r.chair_id = ? LIMIT 1
 			     ) unsent
 			   )`,
