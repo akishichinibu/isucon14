@@ -216,20 +216,10 @@ struct OwnerGetChairResponseChair {
 }
 
 async fn owner_get_chairs(
-    State(AppState { pool, .. }): State<AppState>,
+    State(state): State<AppState>,
     axum::Extension(owner): axum::Extension<Owner>,
 ) -> Result<axum::Json<OwnerGetChairResponse>, Error> {
-    let chairs: Vec<ChairWithDetail> = sqlx::query_as(
-        r#"SELECT id, name, model, is_active, created_at,
-                  CAST(total_distance AS SIGNED) AS total_distance,
-                  total_distance_updated_at
-           FROM chairs
-           WHERE owner_id = ?"#,
-    )
-    .bind(owner.id)
-    .fetch_all(&pool)
-    .await?;
-
+    let chairs = state.world.read().unwrap().owner_chairs(&owner.id);
     Ok(axum::Json(OwnerGetChairResponse {
         chairs: chairs
             .into_iter()
@@ -239,7 +229,7 @@ async fn owner_get_chairs(
                 model: chair.model,
                 active: chair.is_active,
                 registered_at: chair.created_at.timestamp_millis(),
-                total_distance: chair.total_distance,
+                total_distance: chair.total_distance as i64,
                 total_distance_updated_at: chair
                     .total_distance_updated_at
                     .map(|t| t.timestamp_millis()),

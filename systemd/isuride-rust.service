@@ -11,7 +11,7 @@ EnvironmentFile=/home/isucon/env.sh
 User=isucon
 Group=isucon
 ExecStart=/home/isucon/webapp/rust/target/release/isuride
-ExecStop=/bin/kill -s QUIT $MAINPID
+ExecStop=/bin/kill -s TERM $MAINPID
 
 Restart=on-failure
 RestartSec=5

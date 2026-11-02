@@ -6,6 +6,8 @@ use ulid::Ulid;
 pub struct AppState {
     pub pool: sqlx::MySqlPool,
     pub matching_lock: Arc<tokio::sync::Mutex<()>>,
+    pub world: crate::state::SharedWorld,
+    pub matching_enabled: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -95,11 +97,21 @@ pub async fn insert_ride_status(
 }
 
 pub fn spawn_matching(state: AppState) {
+    if !state.matching_enabled {
+        return;
+    }
     tokio::spawn(async move {
         if let Err(err) = crate::internal_handlers::run_matching(&state).await {
             tracing::debug!("matching: {err}");
         }
     });
+}
+
+pub fn is_deadlock(err: &sqlx::Error) -> bool {
+    err.as_database_error()
+        .and_then(|d| d.code())
+        .map(|c| c == "1213")
+        .unwrap_or(false)
 }
 
 // Manhattan distance
@@ -157,3 +169,4 @@ pub mod middlewares;
 pub mod models;
 pub mod owner_handlers;
 pub mod payment_gateway;
+pub mod state;

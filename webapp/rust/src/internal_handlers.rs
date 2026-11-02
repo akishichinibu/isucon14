@@ -16,103 +16,56 @@ async fn internal_get_matching(State(state): State<AppState>) -> Result<StatusCo
 }
 
 pub async fn run_matching(state: &AppState) -> Result<(), Error> {
+    if !state.matching_enabled {
+        return Ok(());
+    }
     let _guard = state.matching_lock.lock().await;
-    match_inner(&state.pool).await
+    match_inner(state).await
 }
 
 pub async fn try_run_matching(state: &AppState) -> Result<(), Error> {
+    if !state.matching_enabled {
+        return Ok(());
+    }
     let Ok(_guard) = state.matching_lock.try_lock() else {
         return Ok(());
     };
-    match_inner(&state.pool).await
+    match_inner(state).await
 }
 
-#[derive(Debug, sqlx::FromRow)]
-struct UnmatchedRide {
-    id: String,
-    pickup_latitude: i32,
-    pickup_longitude: i32,
-}
+async fn match_inner(state: &AppState) -> Result<(), Error> {
+    let assignments = {
+        let mut world = state.world.write().unwrap();
+        world.match_once()
+    };
 
-#[derive(Debug, sqlx::FromRow)]
-struct IdleChair {
-    id: String,
-    latitude: i32,
-    longitude: i32,
-    speed: i32,
-}
-
-/// Assign unmatched rides to the idle chair with the lowest ETA
-/// (manhattan distance / model speed). Oldest rides first.
-async fn match_inner(pool: &sqlx::MySqlPool) -> Result<(), Error> {
-    let rides: Vec<UnmatchedRide> = sqlx::query_as(
-        "SELECT id, pickup_latitude, pickup_longitude FROM rides WHERE chair_id IS NULL ORDER BY created_at",
-    )
-    .fetch_all(pool)
-    .await?;
-    if rides.is_empty() {
-        return Ok(());
-    }
-
-    let mut chairs: Vec<IdleChair> = sqlx::query_as(
-        r#"SELECT c.id, c.latitude, c.longitude, cm.speed
-           FROM chairs c
-           INNER JOIN chair_models cm ON cm.name = c.model
-           WHERE c.is_active = TRUE
-             AND c.latitude IS NOT NULL
-             AND c.longitude IS NOT NULL
-             AND NOT EXISTS (
-               SELECT 1 FROM rides r
-               WHERE r.chair_id = c.id AND r.latest_status <> 'COMPLETED'
-             )
-             AND NOT EXISTS (
-               SELECT 1 FROM rides r
-               INNER JOIN ride_statuses rs ON rs.ride_id = r.id
-                 AND rs.status = 'COMPLETED' AND rs.chair_sent_at IS NULL
-               WHERE r.chair_id = c.id
-             )"#,
-    )
-    .fetch_all(pool)
-    .await?;
-    if chairs.is_empty() {
-        return Ok(());
-    }
-
-    let mut assignments: Vec<(String, String)> = Vec::new();
-    for ride in rides {
-        let mut best_idx = None;
-        let mut best_eta = f64::INFINITY;
-        for (idx, chair) in chairs.iter().enumerate() {
-            if chair.speed <= 0 {
-                continue;
-            }
-            let distance = crate::calculate_distance(
-                ride.pickup_latitude,
-                ride.pickup_longitude,
-                chair.latitude,
-                chair.longitude,
-            );
-            let eta = distance as f64 / chair.speed as f64;
-            if eta < best_eta {
-                best_eta = eta;
-                best_idx = Some(idx);
-            }
-        }
-        if let Some(idx) = best_idx {
-            let chair = chairs.swap_remove(idx);
-            assignments.push((ride.id, chair.id));
-        }
-        if chairs.is_empty() {
-            break;
-        }
-    }
-
-    for (ride_id, chair_id) in assignments {
-        sqlx::query("UPDATE rides SET chair_id = ? WHERE id = ? AND chair_id IS NULL")
+    for (ride_id, chair_id, hint) in assignments {
+        let result = sqlx::query("UPDATE rides SET chair_id = ? WHERE id = ? AND chair_id IS NULL")
             .bind(&chair_id)
             .bind(&ride_id)
-            .execute(pool)
+            .execute(&state.pool)
             .await?;
+        if result.rows_affected() == 0 {
+            // Lost the race; free the chair in memory.
+            let mut world = state.world.write().unwrap();
+            if let Some(c) = world.chairs.get_mut(&chair_id) {
+                if c.current_ride
+                    .as_ref()
+                    .map(|h| h.ride_id == ride_id)
+                    .unwrap_or(false)
+                {
+                    c.current_ride = None;
+                }
+            }
+            world.unmatched.push_front(crate::state::UnmatchedRide {
+                id: ride_id,
+                pickup_latitude: hint.pickup_latitude,
+                pickup_longitude: hint.pickup_longitude,
+                destination_latitude: hint.destination_latitude,
+                destination_longitude: hint.destination_longitude,
+                created_at: chrono::Utc::now(),
+            });
+        }
     }
 
     Ok(())

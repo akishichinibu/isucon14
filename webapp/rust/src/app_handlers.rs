@@ -68,28 +68,67 @@ async fn app_post_users(
     let access_token = crate::secure_random_str(32);
     let invitation_code = crate::secure_random_str(15);
 
+    let mut last_err: Option<Error> = None;
+    for _ in 0..8 {
+        match app_post_users_once(&pool, &req, &user_id, &access_token, &invitation_code).await {
+            Ok(()) => {
+                last_err = None;
+                break;
+            }
+            Err(Error::Sqlx(e)) if crate::is_deadlock(&e) => {
+                last_err = Some(Error::Sqlx(e));
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    if let Some(err) = last_err {
+        return Err(err);
+    }
+
+    let jar = jar.add(
+        axum_extra::extract::cookie::Cookie::build(("app_session", access_token.clone())).path("/"),
+    );
+    return Ok((
+        jar,
+        (
+            StatusCode::CREATED,
+            axum::Json(AppPostUsersResponse {
+                id: user_id,
+                invitation_code,
+            }),
+        ),
+    ));
+}
+
+async fn app_post_users_once(
+    pool: &sqlx::MySqlPool,
+    req: &AppPostUsersRequest,
+    user_id: &str,
+    access_token: &str,
+    invitation_code: &str,
+) -> Result<(), Error> {
     let mut tx = pool.begin().await?;
 
     sqlx::query("INSERT INTO users (id, username, firstname, lastname, date_of_birth, access_token, invitation_code) VALUES (?, ?, ?, ?, ?, ?, ?)")
-        .bind(&user_id)
-        .bind(req.username)
-        .bind(req.firstname)
-        .bind(req.lastname)
-        .bind(req.date_of_birth)
-        .bind(&access_token)
-        .bind(&invitation_code)
+        .bind(user_id)
+        .bind(&req.username)
+        .bind(&req.firstname)
+        .bind(&req.lastname)
+        .bind(&req.date_of_birth)
+        .bind(access_token)
+        .bind(invitation_code)
         .execute(&mut *tx)
         .await?;
 
-    // Welcome coupon for new registrations
     sqlx::query("INSERT INTO coupons (user_id, code, discount) VALUES (?, ?, ?)")
-        .bind(&user_id)
+        .bind(user_id)
         .bind("CP_NEW2024")
         .bind(3000)
         .execute(&mut *tx)
         .await?;
 
-    if let Some(req_invitation_code) = req.invitation_code {
+    if let Some(req_invitation_code) = req.invitation_code.as_ref() {
         if !req_invitation_code.is_empty() {
             let coupons: Vec<Coupon> =
                 sqlx::query_as("SELECT * FROM coupons WHERE code = ? FOR UPDATE")
@@ -102,7 +141,7 @@ async fn app_post_users(
 
             let Some(inviter): Option<User> =
                 sqlx::query_as("SELECT id, username, firstname, lastname, date_of_birth, access_token, created_at, updated_at FROM users WHERE invitation_code = ?")
-                    .bind(&req_invitation_code)
+                    .bind(req_invitation_code)
                     .fetch_optional(&mut *tx)
                     .await?
             else {
@@ -110,7 +149,7 @@ async fn app_post_users(
             };
 
             sqlx::query("INSERT INTO coupons (user_id, code, discount) VALUES (?, ?, ?)")
-                .bind(&user_id)
+                .bind(user_id)
                 .bind(format!("INV_{req_invitation_code}"))
                 .bind(1500)
                 .execute(&mut *tx)
@@ -125,20 +164,7 @@ async fn app_post_users(
     }
 
     tx.commit().await?;
-
-    let jar = jar
-        .add(axum_extra::extract::cookie::Cookie::build(("app_session", access_token)).path("/"));
-
-    Ok((
-        jar,
-        (
-            StatusCode::CREATED,
-            axum::Json(AppPostUsersResponse {
-                id: user_id,
-                invitation_code,
-            }),
-        ),
-    ))
+    Ok(())
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -377,6 +403,15 @@ async fn app_post_rides(
 
     tx.commit().await?;
 
+    state.world.write().unwrap().push_unmatched(crate::state::UnmatchedRide {
+        id: ride_id.clone(),
+        pickup_latitude: req.pickup_coordinate.latitude,
+        pickup_longitude: req.pickup_coordinate.longitude,
+        destination_latitude: req.destination_coordinate.latitude,
+        destination_longitude: req.destination_coordinate.longitude,
+        created_at: chrono::Utc::now(),
+    });
+
     crate::spawn_matching(state);
 
     Ok((
@@ -541,6 +576,9 @@ async fn app_post_ride_evaluation(
 
     tx.commit().await?;
 
+    if let Some(chair_id) = ride.chair_id.as_ref() {
+        state.world.write().unwrap().complete_ride(chair_id);
+    }
     crate::spawn_matching(state);
 
     Ok(axum::Json(AppPostRideEvaluationResponse {
@@ -720,44 +758,27 @@ struct NearbyChairRow {
 }
 
 async fn app_get_nearby_chairs(
-    State(AppState { pool, .. }): State<AppState>,
+    State(state): State<AppState>,
     Query(query): Query<AppGetNearbyChairsQuery>,
 ) -> Result<axum::Json<AppGetNearbyChairsResponse>, Error> {
     let distance = query.distance.unwrap_or(50);
-
-    let nearby_chairs: Vec<NearbyChairRow> = sqlx::query_as(
-        r#"SELECT c.id, c.name, c.model, c.latitude, c.longitude
-           FROM chairs c
-           WHERE c.is_active = TRUE
-             AND c.latitude IS NOT NULL
-             AND c.longitude IS NOT NULL
-             AND ABS(c.latitude - ?) + ABS(c.longitude - ?) <= ?
-             AND NOT EXISTS (
-               SELECT 1 FROM rides r
-               WHERE r.chair_id = c.id AND r.latest_status <> 'COMPLETED'
-             )"#,
-    )
-    .bind(query.latitude)
-    .bind(query.longitude)
-    .bind(distance)
-    .fetch_all(&pool)
-    .await?;
-
-    let retrieved_at: chrono::DateTime<chrono::Utc> =
-        sqlx::query_scalar("SELECT CURRENT_TIMESTAMP(6)")
-            .fetch_one(&pool)
-            .await?;
+    let chairs = state
+        .world
+        .read()
+        .unwrap()
+        .nearby(query.latitude, query.longitude, distance);
+    let retrieved_at = chrono::Utc::now();
 
     Ok(axum::Json(AppGetNearbyChairsResponse {
-        chairs: nearby_chairs
+        chairs: chairs
             .into_iter()
             .map(|chair| AppGetNearbyChairsResponseChair {
                 id: chair.id,
                 name: chair.name,
                 model: chair.model,
                 current_coordinate: Coordinate {
-                    latitude: chair.latitude,
-                    longitude: chair.longitude,
+                    latitude: chair.latitude.unwrap_or(0),
+                    longitude: chair.longitude.unwrap_or(0),
                 },
             })
             .collect(),

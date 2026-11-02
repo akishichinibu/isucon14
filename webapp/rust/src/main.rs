@@ -40,15 +40,31 @@ async fn main() -> anyhow::Result<()> {
         )
         .await?;
 
+    let matching_enabled = std::env::var("ISUCON_ENABLE_MATCHING")
+        .map(|v| {
+            let v = v.trim().trim_matches('"').to_ascii_lowercase();
+            v != "0" && v != "false" && v != "off"
+        })
+        .unwrap_or(true);
+
+    let world = isuride::state::load_world(&pool)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!("world load on boot failed (empty until initialize): {err}");
+            isuride::state::World::default()
+        });
+
     let app_state = AppState {
         pool,
         matching_lock: Arc::new(tokio::sync::Mutex::new(())),
+        world: std::sync::Arc::new(std::sync::RwLock::new(world)),
+        matching_enabled,
     };
 
-    {
+    if matching_enabled {
         let state = app_state.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(100));
+            let mut interval = tokio::time::interval(Duration::from_millis(50));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
@@ -89,13 +105,21 @@ struct PostInitializeResponse {
 }
 
 async fn post_initialize(
-    State(AppState { pool, .. }): State<AppState>,
+    State(state): State<AppState>,
     axum::Json(req): axum::Json<PostInitializeRequest>,
 ) -> Result<axum::Json<PostInitializeResponse>, Error> {
+    {
+        let mut world = state.world.write().unwrap();
+        world.paused = true;
+        world.chairs.clear();
+        world.unmatched.clear();
+    }
+
     let output = tokio::process::Command::new("../sql/init.sh")
         .output()
         .await?;
     if !output.status.success() {
+        state.world.write().unwrap().paused = false;
         return Err(Error::Initialize {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -104,8 +128,15 @@ async fn post_initialize(
 
     sqlx::query("UPDATE settings SET value = ? WHERE name = 'payment_gateway_url'")
         .bind(req.payment_server)
-        .execute(&pool)
+        .execute(&state.pool)
         .await?;
+
+    let loaded = isuride::state::load_world(&state.pool).await?;
+    {
+        let mut world = state.world.write().unwrap();
+        *world = loaded;
+        world.paused = false;
+    }
 
     Ok(axum::Json(PostInitializeResponse { language: "rust" }))
 }
