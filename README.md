@@ -14,11 +14,17 @@ Baseline is the official Go reference, scored on this homelab.
 
 HTTPS `https://isuride.xiv.isucon.net` → `.210`. Language: Go.
 
-## Baseline
+## Scores (60s bench on isucon14-1)
 
-- Commit: initial Go reference as deployed 2026-11-02
-- Bench: `pass=true` score **2042** (60s), two CODE=26 `total_distance` lag warnings
-- Command: `bash scripts/run-bench.sh`
+| Tree | Result | Score |
+|------|--------|-------|
+| `main` initial Go reference | pass | 2042 |
+| `feat/go-opt` indexes + matching + JSON notify | pass | **32498** (four CODE=26 warnings) |
+
+```bash
+bash scripts/deploy.sh
+bash scripts/run-bench.sh
+```
 
 ## Layout
 
