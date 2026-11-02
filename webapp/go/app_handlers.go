@@ -670,26 +670,22 @@ func appGetNotification(w http.ResponseWriter, r *http.Request) {
 	sentAnything := false
 
 	process := func() error {
-		for {
-			data, unsent, err := fetchAppNotification(ctx, user.ID)
-			if err != nil {
+		data, unsent, err := fetchAppNotification(ctx, user.ID)
+		if err != nil {
+			return err
+		}
+		if data == nil {
+			return nil
+		}
+		if unsent || !sentAnything || data.RideID != lastRideID || data.Status != lastStatus {
+			if err := writeSSE(w, flusher, data); err != nil {
 				return err
 			}
-			if data == nil {
-				return nil
-			}
-			if unsent || !sentAnything || data.RideID != lastRideID || data.Status != lastStatus {
-				if err := writeSSE(w, flusher, data); err != nil {
-					return err
-				}
-				lastRideID = data.RideID
-				lastStatus = data.Status
-				sentAnything = true
-			}
-			if !unsent {
-				return nil
-			}
+			lastRideID = data.RideID
+			lastStatus = data.Status
+			sentAnything = true
 		}
+		return nil
 	}
 
 	if err := process(); err != nil {
